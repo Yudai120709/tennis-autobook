@@ -17,14 +17,14 @@
     }
   ],
   "weekend_all": true,
-  "weekday_start_from": 9,
+  "weekday_start_from": 19,
   "holidays_as_weekend": true,
   "days_from": 6,
   "days_ahead": 60,
   "wait_seconds": 2,
   "auto_book": {
     "enabled": true,
-    "mode": "rehearsal",
+    "mode": "book",
     "max_per_run": null,
     "max_active": null,
     "one_per_day": false,
