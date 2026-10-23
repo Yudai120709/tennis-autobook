@@ -2,11 +2,19 @@ name: テニスコート監視・自動予約
 
 on:
   schedule:
-    # 毎時7分（日本時間）に空きを確認。※GitHubの時刻はUTC
-    - cron: "7 * * * *"
-    # 毎月21日 23:20 と 23:40（日本時間）に、22日0:00 の一斉予約ジョブを起動（2本目は1本目が起動しなかったときの予備）
-    - cron: "20 14 21 * *"
-    - cron: "40 14 21 * *"
+    # 毎時7分（日本時間）に空きを確認。※GitHubの時刻はUTC（日本時間－9時間）
+    # 日本時間 2:07・3:07・4:07 は起動しない（UTC 17〜19時を除く）
+    # 日本時間 22:07・23:07・0:07（UTC 13〜15時）は、21日の夜（UTC 21日）だけ起動しない
+    #   → 一斉予約の前後に毎時確認が割り込んで、一斉予約が順番待ちで取り消されるのを防ぐ
+    - cron: "7 0-12,16,20-23 * * *"
+    - cron: "7 13-15 1-20,22-31 * *"
+    # ただし日本時間22日の 2:07・3:07・4:07 は起動する（UTC では21日の17〜19時）
+    - cron: "7 17-19 21 * *"
+    # 毎月21日 22:23 と 22:53（日本時間）に、22日0:00 の一斉予約ジョブを起動
+    #   GitHubの定期実行は30分前後遅れることがあるため早めに起動し、中で0時まで待つ
+    #   2本目は1本目が起動しなかったときの予備（1本目が終わっていれば何もしない）
+    - cron: "23 13 21 * *"
+    - cron: "53 13 21 * *"
   workflow_dispatch:
     inputs:
       task:
@@ -25,7 +33,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -38,10 +46,10 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "task=${{ inputs.task }}" >> "$GITHUB_OUTPUT"
-          elif [ "${{ github.event.schedule }}" = "7 * * * *" ]; then
-            echo "task=check" >> "$GITHUB_OUTPUT"
-          else
+          elif [ "${{ github.event.schedule }}" = "23 13 21 * *" ] || [ "${{ github.event.schedule }}" = "53 13 21 * *" ]; then
             echo "task=release" >> "$GITHUB_OUTPUT"
+          else
+            echo "task=check" >> "$GITHUB_OUTPUT"
           fi
 
       - name: 空き状況を確認
