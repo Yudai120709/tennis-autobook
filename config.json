@@ -1,0 +1,51 @@
+{
+  "targets": [
+    {
+      "sport": "1000_1030",
+      "park": "1060",
+      "memo": "木場公園"
+    },
+    {
+      "sport": "1000_1030",
+      "park": "1040",
+      "memo": "猿江恩賜公園"
+    },
+    {
+      "sport": "1000_1030",
+      "park": "1050",
+      "memo": "亀戸中央公園"
+    }
+  ],
+  "weekend_all": true,
+  "weekday_start_from": 19,
+  "holidays_as_weekend": true,
+  "days_from": 6,
+  "days_ahead": 60,
+  "wait_seconds": 2,
+  "auto_book": {
+    "enabled": true,
+    "mode": "rehearsal",
+    "max_per_run": null,
+    "max_active": null,
+    "one_per_day": false,
+    "try_per_run": null,
+    "max_attempts_per_slot": 2,
+    "players": 4
+  },
+  "release": {
+    "enabled": true,
+    "max_bookings": null,
+    "weekend_first": true,
+    "preferred_start_hours": [
+      9,
+      11,
+      13,
+      15,
+      17,
+      19,
+      7
+    ],
+    "start_delay_seconds": 1,
+    "login_minutes_before": 5
+  }
+}

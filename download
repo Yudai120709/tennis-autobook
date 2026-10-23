@@ -1,0 +1,4 @@
+book_queue.json
+shots/
+__pycache__/
+*.tmp
