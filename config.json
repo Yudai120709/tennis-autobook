@@ -17,7 +17,7 @@
     }
   ],
   "weekend_all": true,
-  "weekday_start_from": 19,
+  "weekday_start_from": 9,
   "holidays_as_weekend": true,
   "days_from": 6,
   "days_ahead": 60,
