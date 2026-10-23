@@ -81,6 +81,7 @@ class Booker:
             self.shot("mfa")
             raise Stop("ログイン時に追加の認証（SMS等）を求められたため、自動では進めません")
         print("  ログインしました")
+        self.shot("after_login")
 
     def open_week(self, v):
         """ログイン状態で、指定の公園・日付の空き状況画面を開く"""
@@ -122,18 +123,62 @@ class Booker:
             return !!el;
         }})()""")
 
-    def wait_week(self, cid):
+    def wait_week(self, cid, sec=60):
         try:
-            self.page.wait_for_function(f"document.getElementById('{cid}') !== null", timeout=60000)
+            self.page.wait_for_function(f"document.getElementById('{cid}') !== null", timeout=sec * 1000)
         except PwTimeout:
             return False
         return True
+
+    def wait_grid_or_error(self, cid, sec):
+        """表が出たら True。「再度操作を行って下さい」等の警告が出たら、待たずに False を返す"""
+        n0 = len(self.dialogs)
+        end = time.time() + sec
+        while time.time() < end:
+            try:
+                if self.page.evaluate(f"document.getElementById('{cid}') !== null"):
+                    return True
+            except Exception:
+                pass
+            if len(self.dialogs) > n0:
+                return False   # 通信エラーの警告が出た → すぐ再操作する
+            time.sleep(0.5)
+        return False
+
+    def ensure_grid(self, opener, cid, tries=10):
+        """空き状況の表が出るまで再操作をくり返す。
+        警告が出たらすぐ表の読み込みをやり直し、それでもだめなら画面ごと開き直す（最大 tries 回）"""
+        for i in range(tries):
+            if self.wait_grid_or_error(cid, 60):
+                return True
+            if i == 0:
+                self.shot("grid_missing")
+            print(f"  表が出ません（{i + 1}/{tries}回目）。再度操作します")
+            time.sleep(2)
+            try:
+                self.page.evaluate("typeof getWeekInfoAjax === 'function' && getWeekInfoAjax(11, 0, 0)")
+            except Exception:
+                pass
+            if self.wait_grid_or_error(cid, 30):
+                return True
+            time.sleep(min(5 * (i + 1), 30))   # 混雑していそうなら少しずつ間をあける
+            try:
+                self.open_week(opener)   # 画面ごと開き直す
+            except Exception as e:
+                print(f"  画面の開き直しに失敗: {e}")
+                try:
+                    self.login()
+                    self.open_week(opener)
+                except Exception:
+                    pass
+        self.shot("grid_missing_last")
+        return False
 
     def book_cell(self, v):
         """空き状況画面上の1枠を予約する。成功で True、空いていなければ False、途中停止は Stop"""
         pg = self.page
         cid = f'{v["useDay"]}_{v["tzoneNo"]}'
-        if not self.wait_week(cid) or not self.cell_available(cid):
+        if not self.wait_week(cid, 10) or not self.cell_available(cid):
             return False
         pg.evaluate(f"""(() => {{
             const td = document.getElementById('{cid}');
@@ -271,7 +316,10 @@ def run(candidates, max_new, title):
     results, done, stop_reason = [], 0, None
     if not candidates:
         print("予約候補はありません")
+        if title == "22日一斉予約":
+            notify(f"【{title}】候補なし", "条件に合う翌月分の枠が見つかりませんでした（予約は行っていません）")
         return
+    weeks, grid_ok, grid_ng, empty = 0, 0, 0, 0
     with sync_playwright() as p:
         browser = p.chromium.launch()
         page = browser.new_page(locale="ja-JP", viewport={"width": 1280, "height": 1600})
@@ -292,6 +340,18 @@ def run(candidates, max_new, title):
                         if need_open:
                             b.open_week(opener)   # その週の7日分が1画面に出る
                             need_open = False
+                            weeks += 1
+                            if b.ensure_grid(opener, f'{v["useDay"]}_{v["tzoneNo"]}'):
+                                grid_ok += 1
+                                if grid_ok == 1:
+                                    b.shot("week_first")
+                            else:
+                                grid_ng += 1
+                                results.append(f"× {opener['park']} {opener['court']} {opener['date']}の週：空き状況の表を読み込めませんでした")
+                                if grid_ng >= 3 and grid_ok == 0:
+                                    raise Stop("何度開き直しても空き状況の表が出ないため止めました"
+                                               "（警告: " + (b.dialogs[-1].replace(chr(10), ' ') if b.dialogs else "なし") + "）")
+                                break
                         ok = b.book_cell(v)
                     except Stop:
                         raise
@@ -300,6 +360,8 @@ def run(candidates, max_new, title):
                         results.append(f"× {label(v)}（失敗: {str(e)[:120]}）")
                         need_open = True
                         continue
+                    if not ok:
+                        empty += 1
                     if ok:
                         done += 1
                         need_open = True
@@ -318,7 +380,8 @@ def run(candidates, max_new, title):
         finally:
             browser.close()
     save_state(state)
-    lines = results[:]
+    lines = [f"候補 {len(candidates)} 枠／画面を開いた週 {weeks}（表が出た {grid_ok}・出なかった {grid_ng}）／"
+             f"空いていなかった枠 {empty}／予約 {done} 件", ""] + results
     if stop_reason:
         lines.append(f"停止: {stop_reason}")
     if REHEARSAL:
