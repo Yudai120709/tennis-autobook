@@ -19,10 +19,15 @@ SHOTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shots")
 os.makedirs(SHOTS, exist_ok=True)
 
 FINAL_WORDS = ("確定", "申込", "申し込", "予約する", "完了", "登録")
+FINAL_EXACT = ("予約",)  # 予約内容確認画面の確定ボタンは「予約」だけの名前
 NEXT_WORDS = ("次へ", "確認", "進む")
 AVOID_WORDS = ("戻る", "もどる", "中止", "キャンセル", "取消", "ホーム", "閉じる", "ログアウト", "削除")
 ONLINE_PAY = ("オンライン", "クレジット", "事前決済", "カード")
 ONSITE_PAY = ("現地", "窓口", "当日", "後払", "施設で", "支払わない")
+
+
+BOOK_VERSION = "2026-10-23 v4（仮押さえの解除・選択失敗の理由）"
+print("book.py 版:", BOOK_VERSION)
 
 
 class Stop(Exception):
@@ -34,6 +39,7 @@ class Booker:
         self.page = page
         self.n = 0
         self.dialogs = []
+        self.last_select_error = ""
         page.on("dialog", self.on_dialog)
 
     # ブラウザの alert / confirm への対応
@@ -41,7 +47,9 @@ class Booker:
         msg = d.message
         self.dialogs.append(msg)
         print(f"  ダイアログ: {msg}")
-        if d.type == "confirm":
+        if d.type == "confirm" and "選択情報をリセット" in msg:
+            d.accept()   # 自分の仮押さえ（選択中の枠）を解除する確認だけは同意する
+        elif d.type == "confirm":
             # ペナルティ等の警告には同意しない。予約の最終確認だけ、本番モードで同意する
             ok = (not REHEARSAL) and any(w in msg for w in ("予約", "申込", "申し込", "確定")) \
                 and not any(w in msg for w in ("ペナルティ", "キャンセル", "取消", "削除", "中止"))
@@ -174,12 +182,29 @@ class Booker:
         self.shot("grid_missing_last")
         return False
 
+    def reset_selection(self, cid=None):
+        """画面の「選択解除」を押して、残っている仮押さえを手放す（失敗しても先へ進む）"""
+        pg = self.page
+        try:
+            if not pg.evaluate("typeof akireset === 'function' && !!document.form1"):
+                return False
+            pg.evaluate("akireset(document.form1)")
+            time.sleep(2)
+            if cid:
+                self.wait_week(cid, 30)
+            print("  選択解除を押して、残っていた仮押さえを解除しました")
+            return True
+        except Exception as e:
+            print(f"  選択解除に失敗: {str(e)[:100]}")
+            return False
+
     def book_cell(self, v):
         """空き状況画面上の1枠を予約する。成功で True、空いていなければ False、途中停止は Stop"""
         pg = self.page
         cid = f'{v["useDay"]}_{v["tzoneNo"]}'
         if not self.wait_week(cid, 10) or not self.cell_available(cid):
             return False
+        n_dlg = len(self.dialogs)
         pg.evaluate(f"""(() => {{
             const td = document.getElementById('{cid}');
             (td.querySelector('[onclick*="setReserv"]') || td).click();
@@ -188,7 +213,9 @@ class Booker:
             pg.wait_for_function("document.form1.selectSize && document.form1.selectSize.value != '0'", timeout=30000)
         except PwTimeout:
             self.shot("select_failed")
-            return False
+            msg = self.dialogs[-1].replace("\n", " ") if len(self.dialogs) > n_dlg else "警告なし"
+            self.last_select_error = msg
+            return None   # 空いているのに選べなかった
         self.shot("selected")
         try:
             with pg.expect_navigation(timeout=30000):
@@ -213,15 +240,26 @@ class Booker:
             self.fill_basics()
             btns = self.buttons()
             nxt = [b for b in btns if any(w in b[1] for w in NEXT_WORDS) and not any(w in b[1] for w in FINAL_WORDS)]
-            fin = [b for b in btns if any(w in b[1] for w in FINAL_WORDS)]
+            fin = [b for b in btns if any(w in b[1] for w in FINAL_WORDS)
+                   or re.sub(r"[^\w\u3040-\u30ff\u4e00-\u9fff]", "", b[1]) in FINAL_EXACT]
+            if not nxt and not fin and "予約内容確認" in body:
+                # 予約内容確認画面：「キャンセル」以外の目立つボタン（btn-go など）を確定ボタンとみなす
+                fin = [b for b in btns if b[2]]
+            print("  画面内のボタン: " + " / ".join(b[1].replace("\n", " ")[:20] for b in btns))
             if nxt:
                 target = nxt[0]
             elif fin:
+                missing = self.missing_required()
+                self.shot(f"apply{step}_filled")
+                if missing:
+                    raise Stop("必須の入力欄が空のままです: " + "、".join(missing))
                 if REHEARSAL:
                     raise Stop(f"リハーサルのため「{fin[0][1]}」ボタンの直前で止めました（予約はされていません）")
                 target = fin[0]
             else:
-                raise Stop("次に押すボタンが判断できない画面になったため止めました")
+                self.dump_page(f"apply{step}_unknown")
+                names = "、".join(b[1].replace("\n", " ")[:20] for b in btns) or "なし"
+                raise Stop("次に押すボタンが判断できない画面になったため止めました（見つかったボタン：" + names + "）")
             print(f"  「{target[1]}」を押します")
             before = pg.url + str(len(body))
             target[0].click()
@@ -235,17 +273,42 @@ class Booker:
         raise Stop("申込画面が想定より長く続いたため止めました")
 
     def buttons(self):
+        """押せる部品（ボタン・リンク・onclick付き要素）を集める。画面上部のメニューは除く"""
         out = []
-        for el in self.page.query_selector_all("button, input[type=button], input[type=submit], a.btn"):
+        sel = ("button, input[type=button], input[type=submit], input[type=image], "
+               "a, [onclick], [role=button]")
+        seen = set()
+        for el in self.page.query_selector_all(sel):
             try:
                 if not el.is_visible():
                     continue
-                t = (el.inner_text() or el.get_attribute("value") or "").strip()
+                info = el.evaluate("""e => {
+                    const r = e.getBoundingClientRect();
+                    return {
+                        nav: !!e.closest('header, nav, .navbar, .dropdown-menu, #header, .modal, footer'),
+                        top: r.top + window.scrollY,
+                        go: /btn-go|btn-primary|btn-next|btn-submit/.test(e.className || '') || /btn-go/.test(e.id || ''),
+                        key: e.outerHTML.slice(0, 200)
+                    };
+                }""")
+                if info["nav"] or info["top"] < 175 or info["key"] in seen:
+                    continue
+                seen.add(info["key"])
+                t = (el.inner_text() or el.get_attribute("value") or el.get_attribute("alt") or "").strip()
             except Exception:
                 continue
             if t and not any(w in t for w in AVOID_WORDS):
-                out.append((el, t))
+                out.append((el, t, info["go"]))
         return out
+
+    def dump_page(self, name):
+        """止まったときに画面の作り（HTML）を保存する"""
+        try:
+            p = os.path.join(SHOTS, f"{dt.datetime.now(JST):%m%d_%H%M%S}_{name}.html")
+            with open(p, "w", encoding="utf-8") as f:
+                f.write(self.page.content())
+        except Exception:
+            pass
 
     def choose_onsite_payment(self):
         """支払方法の選択肢があれば、オンライン決済ではない方を選ぶ"""
@@ -265,18 +328,49 @@ class Booker:
     def fill_basics(self):
         """利用人数が空欄なら設定値を入れ、同意のチェックを付ける"""
         players = str(AB.get("players", 4))
-        self.page.evaluate("""(n) => {
-            for (const el of document.querySelectorAll('input[type=text], input[type=tel], input[type=number]')) {
+        n = self.page.evaluate("""(n) => {
+            let filled = 0;
+            const rowText = (el) => {
+                const r = el.closest('tr, .row, .form-group, dl, li');
+                return (r ? r.innerText : '') || '';
+            };
+            for (const el of document.querySelectorAll('input[type=text], input[type=tel], input[type=number], input:not([type])')) {
                 const lab = ((el.labels && el.labels[0] ? el.labels[0].innerText : '') + ' ' + (el.name||'') + ' ' + (el.id||'')
-                             + ' ' + (el.closest('tr') ? el.closest('tr').innerText : '')).toLowerCase();
-                if ((lab.includes('人数') || lab.includes('ninzu') || lab.includes('ninzuu')) && !el.value) el.value = n;
+                             + ' ' + rowText(el)).toLowerCase();
+                if ((lab.includes('人数') || lab.includes('ninzu')) && !el.value) {
+                    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+                    setter.call(el, n);
+                    el.dispatchEvent(new Event('input', {bubbles: true}));
+                    el.dispatchEvent(new Event('change', {bubbles: true}));
+                    el.dispatchEvent(new Event('blur', {bubbles: true}));
+                    filled++;
+                }
             }
             for (const el of document.querySelectorAll('input[type=checkbox]')) {
                 const lab = (el.labels && el.labels[0] ? el.labels[0].innerText : (el.parentElement ? el.parentElement.innerText : '')) || '';
                 if (lab.includes('同意') && !el.checked) el.click();
             }
+            return filled;
         }""", players)
+        if n:
+            print(f"  利用人数に {players} を入力しました（{n}か所）")
 
+    def missing_required(self):
+        """「必須」と書かれた行で、空のままの入力欄の項目名を返す"""
+        return self.page.evaluate("""() => {
+            const out = [];
+            for (const r of document.querySelectorAll('tr, .row, .form-group')) {
+                const t = r.innerText || '';
+                if (!t.includes('必須')) continue;
+                for (const el of r.querySelectorAll('input[type=text], input[type=tel], input[type=number], input:not([type]), select')) {
+                    if (el.offsetParent !== null && !el.value) {
+                        out.push(t.split('必須')[0].trim().split('\\n')[0]);
+                        break;
+                    }
+                }
+            }
+            return [...new Set(out)];
+        }""")
 
 def deadline(date_iso):
     d = dt.date.fromisoformat(date_iso)
@@ -320,6 +414,7 @@ def run(candidates, max_new, title):
             notify(f"【{title}】候補なし", "条件に合う翌月分の枠が見つかりませんでした（予約は行っていません）")
         return
     weeks, grid_ok, grid_ng, empty = 0, 0, 0, 0
+    select_ng, reset_done = 0, False
     with sync_playwright() as p:
         browser = p.chromium.launch()
         page = browser.new_page(locale="ja-JP", viewport={"width": 1280, "height": 1600})
@@ -342,6 +437,9 @@ def run(candidates, max_new, title):
                             need_open = False
                             weeks += 1
                             if b.ensure_grid(opener, f'{v["useDay"]}_{v["tzoneNo"]}'):
+                                if not reset_done:
+                                    b.reset_selection(f'{v["useDay"]}_{v["tzoneNo"]}')   # 前回の仮押さえを残さない
+                                    reset_done = True
                                 grid_ok += 1
                                 if grid_ok == 1:
                                     b.shot("week_first")
@@ -360,6 +458,15 @@ def run(candidates, max_new, title):
                         results.append(f"× {label(v)}（失敗: {str(e)[:120]}）")
                         need_open = True
                         continue
+                    if ok is None:
+                        select_ng += 1
+                        results.append(f"× {label(v)}：空きなのに選択できませんでした（{b.last_select_error[:80]}）")
+                        b.reset_selection()
+                        reset_done = False
+                        need_open = True
+                        if select_ng >= 3 and done == 0:
+                            raise Stop("空いている枠を押しても選択できない状態が続いたため止めました（警告: " + b.last_select_error[:80] + "）")
+                        continue
                     if not ok:
                         empty += 1
                     if ok:
@@ -374,6 +481,15 @@ def run(candidates, max_new, title):
                     break
         except Stop as e:
             stop_reason = str(e)
+            if REHEARSAL and "直前で止めました" in stop_reason:
+                # リハーサルで押さえた枠を残さない：空き状況の画面に戻って「選択解除」
+                try:
+                    b.page.go_back(wait_until="domcontentloaded", timeout=60000)
+                    time.sleep(3)
+                    b.reset_selection()
+                    b.shot("after_reset")
+                except Exception as e2:
+                    print(f"  戻って選択解除できませんでした: {str(e2)[:100]}")
         except Exception as e:
             stop_reason = f"想定外のエラー: {str(e)[:200]}"
             b.shot("error")
@@ -381,7 +497,7 @@ def run(candidates, max_new, title):
             browser.close()
     save_state(state)
     lines = [f"候補 {len(candidates)} 枠／画面を開いた週 {weeks}（表が出た {grid_ok}・出なかった {grid_ng}）／"
-             f"空いていなかった枠 {empty}／予約 {done} 件", ""] + results
+             f"空いていなかった枠 {empty}／空きなのに選べなかった枠 {select_ng}／予約 {done} 件", ""] + results
     if stop_reason:
         lines.append(f"停止: {stop_reason}")
     if REHEARSAL:
