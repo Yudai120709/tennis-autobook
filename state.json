@@ -45,5 +45,6 @@
  "booked": [],
  "attempts": {},
  "release_done": "2026-11",
- "offers": {}
+ "offers": {},
+ "last_hourly_report": "2026-11-02T15:57:21.520242+09:00"
 }
