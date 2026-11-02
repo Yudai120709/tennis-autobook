@@ -41,6 +41,36 @@
       "park": "1150",
       "memo": "篠崎公園Ａ",
       "days": "holiday"
+    },
+    {
+      "sport": "1000_1030",
+      "park": "1360",
+      "memo": "有明テニスＣ人工芝コート",
+      "days": "holiday"
+    },
+    {
+      "sport": "1000_1020",
+      "park": "1350",
+      "memo": "有明テニスＡ屋外ハードコート",
+      "days": "holiday"
+    },
+    {
+      "sport": "1000_1030",
+      "park": "1130",
+      "memo": "東綾瀬公園",
+      "days": "holiday"
+    },
+    {
+      "sport": "1000_1030",
+      "park": "1090",
+      "memo": "東白鬚公園",
+      "days": "holiday"
+    },
+    {
+      "sport": "1000_1030",
+      "park": "1170",
+      "memo": "汐入公園",
+      "days": "holiday"
     }
   ],
   "weekend_all": true,
