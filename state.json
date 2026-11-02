@@ -44,5 +44,6 @@
  },
  "booked": [],
  "attempts": {},
- "release_done": "2026-11"
+ "release_done": "2026-11",
+ "offers": {}
 }
