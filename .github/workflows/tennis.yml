@@ -2,14 +2,26 @@ name: テニスコート監視・自動予約
 
 on:
   schedule:
-    # 毎時7分（日本時間）に空きを確認。※GitHubの時刻はUTC（日本時間－9時間）
-    # 日本時間 2:07・3:07・4:07 は起動しない（UTC 17〜19時を除く）
-    # 日本時間 22:07・23:07・0:07（UTC 13〜15時）は、21日の夜（UTC 21日）だけ起動しない
-    #   → 一斉予約の前後に毎時確認が割り込んで、一斉予約が順番待ちで取り消されるのを防ぐ
-    - cron: "7 0-12,16,20-23 * * *"
-    - cron: "7 13-15 1-20,22-31 * *"
-    # ただし日本時間22日の 2:07・3:07・4:07 は起動する（UTC では21日の17〜19時）
-    - cron: "7 17-19 21 * *"
+    # ※GitHubの時刻はUTC（日本時間－9時間）。下の日付もUTCの日付で書いている
+    # 【ふだん】日本時間 毎時7分の1時間おき。深夜1:00〜5:59は休み
+    - cron: "7 0-14 1-20,26-31 * *"
+    - cron: "7 15 1-20,25-31 * *"
+    - cron: "7 21-23 1-20,25-31 * *"
+    # 【ふだん・火曜と水曜】上に加えて22・37・52分も動かし、15分おきにする（深夜1:00〜5:59は休み）
+    #   曜日で指定するため21日夜〜25日にも当たる。その日は下の gate ジョブで止める
+    - cron: "22,37,52 0-14 * * 2,3"
+    - cron: "22,37,52 15,21-23 * * 1,2"
+    # 【21日】日本時間21:07が最後（22:00〜23:59は一斉予約のため休み）
+    - cron: "7 0-12 21 * *"
+    # 【22日】一斉予約のあと、日本時間0:03〜23:53の1日中10分おき（深夜も動く）
+    - cron: "3,13,23,33,43,53 15-23 21 * *"
+    - cron: "3,13,23,33,43,53 0-14 22 * *"
+    # 【23日】日本時間 毎時7・22・37・52分の15分おき。深夜1:00〜5:59は休み
+    - cron: "7,22,37,52 0-14 23 * *"
+    - cron: "7,22,37,52 15,21-23 22 * *"
+    # 【24・25日】日本時間 毎時7・27・47分の20分おき。深夜1:00〜5:59は休み
+    - cron: "7,27,47 0-14 24-25 * *"
+    - cron: "7,27,47 15,21-23 23-24 * *"
     # 毎月21日 22:23 と 22:53（日本時間）に、22日0:00 の一斉予約ジョブを起動
     #   GitHubの定期実行は30分前後遅れることがあるため早めに起動し、中で0時まで待つ
     #   2本目は1本目が起動しなかったときの予備（1本目が終わっていれば何もしない）
@@ -20,18 +32,35 @@ on:
       task:
         description: "実行する処理"
         type: choice
-        options: [check, release_now]
+        options: [check, release_now, test_book]   # test_book = 平日の昼間の枠を試しに1件だけ予約
         default: check
 
 permissions:
   contents: write
 
-concurrency:
-  group: tennis
-  cancel-in-progress: false
-
 jobs:
+  # 火曜・水曜の追加分（曜日指定）だけ、21日22時〜25日は動かさない（数秒で終わる）
+  gate:
+    if: github.event.schedule == '22,37,52 0-14 * * 2,3' || github.event.schedule == '22,37,52 15,21-23 * * 1,2'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      go: ${{ steps.g.outputs.go }}
+    steps:
+      - id: g
+        run: |
+          d=$(TZ=Asia/Tokyo date +%-d); h=$(TZ=Asia/Tokyo date +%-H); go=true
+          if [ "$d" -ge 22 ] && [ "$d" -le 25 ]; then go=false; fi
+          if [ "$d" -eq 21 ] && [ "$h" -ge 22 ]; then go=false; fi
+          echo "日本時間 ${d}日 ${h}時 → go=$go"
+          echo "go=$go" >> "$GITHUB_OUTPUT"
+
   run:
+    needs: gate
+    if: ${{ !cancelled() && (needs.gate.result == 'skipped' || needs.gate.outputs.go == 'true') }}
+    concurrency:
+      group: tennis
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     timeout-minutes: 240
     steps:
@@ -52,24 +81,19 @@ jobs:
             echo "task=check" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: 空き状況を確認
-        id: check
-        if: steps.task.outputs.task == 'check'
-        env:
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          GMAIL_USER: ${{ secrets.GMAIL_USER }}
-          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
-          MAIL_TO: ${{ secrets.MAIL_TO }}
-        run: python check_courts.py
+      - name: ブラウザを使い回す（準備を速くする）
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-v1
 
-      - name: ブラウザを準備（予約するときだけ）
-        if: steps.check.outputs.book == 'true' || steps.task.outputs.task != 'check'
+      - name: ブラウザを準備
         run: |
           pip install playwright
           python -m playwright install --with-deps chromium
 
-      - name: 空いた枠を予約
-        if: steps.check.outputs.book == 'true'
+      - name: ログインした状態で空きを確認・予約（ログインと空き確認を同時に進める）
+        if: steps.task.outputs.task == 'check' || steps.task.outputs.task == 'test_book'
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
@@ -77,7 +101,8 @@ jobs:
           MAIL_TO: ${{ secrets.MAIL_TO }}
           SPOREC_USER_ID: ${{ secrets.SPOREC_USER_ID }}
           SPOREC_PASSWORD: ${{ secrets.SPOREC_PASSWORD }}
-        run: python book.py
+          TEST_BOOK: ${{ steps.task.outputs.task == 'test_book' && '1' || '' }}
+        run: python book.py --watch
 
       - name: 22日0:00 の一斉予約
         if: steps.task.outputs.task == 'release' || steps.task.outputs.task == 'release_now'
