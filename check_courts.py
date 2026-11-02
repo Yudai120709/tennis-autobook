@@ -2,6 +2,7 @@
 """テニスコート空き枠の監視・メール通知（ログイン不要の公開空き状況検索を使用）。
 条件に合う新しい空き枠が見つかったら、即座にメールで通知する。
 22日の一斉解放時は --release オプションで0時ジャストまで待機し、上位4公園を最優先で同時並行スキャンする。
+1時間に1回、空きがなくても監視状況を定期メールで送信する。
 """
 import concurrent.futures
 import datetime as dt, html, json, os, re, sys, time, urllib.parse
@@ -99,8 +100,7 @@ def scan_target(prio, tgt, first, last, wait):
                 for r in j.get("result", []):
                     for t in r.get("timeResult", []):
                         d = dt.datetime.strptime(str(t["useDay"]), "%Y%m%d").date()
-                        if t.get("status") == 0 and t.get("alt") == "空き" and first <= d <= last \
-                                and wanted(d, t["startTime"], t["useDay"] in hol, tgt):
+                        if t.get("status") == 0 and t.get("alt") == "空き" and first <= d <= last                                 and wanted(d, t["startTime"], t["useDay"] in hol, tgt):
                             found.append({
                                 "key": f'{sport}_{bld}_{inst}_{t["useDay"]}_{t["startTime"]}',
                                 "sport": sport, "bld": bld, "inst": inst, "useDay": t["useDay"],
@@ -239,14 +239,50 @@ def main():
 
     print(f"確認完了: 検出 {len(sorted_slots)} 件（全体での新規通知対象: {len(new_slots)} 件）", flush=True)
 
+    # 1時間に1回の定期生存報告（空きがなくても送る）
+    now_dt = dt.datetime.now(JST)
+    last_report_str = state.get("last_hourly_report")
+    send_hourly = False
+    if last_report_str:
+        try:
+            last_report_dt = dt.datetime.fromisoformat(last_report_str)
+            # 前回送信から50分以上経過していれば送信（10分おき実行で毎時1回送るため）
+            if (now_dt - last_report_dt).total_seconds() >= 3000:
+                send_hourly = True
+        except Exception:
+            send_hourly = True
+    else:
+        # 初回は送信
+        send_hourly = True
+
     if new_slots:
         tag = "【22日一斉解放】" if is_release else "【空き発見】"
         send_notification(new_slots, tag=tag)
         for s in new_slots:
             state["notified"][s["key"]] = s["date"]
+        state["last_hourly_report"] = now_dt.isoformat()
         save_state(state)
     elif not is_release:
         print("新規の空き枠はありませんでした。")
+        if send_hourly:
+            print("1時間に1回の定期報告メールを送信します。", flush=True)
+            subj = "【定期報告】テニスコート監視中（現在空きなし）"
+            lines = [
+                f"{subj}\n",
+                f"確認時刻: {now_dt.strftime('%Y/%m/%d %H:%M')}",
+                f"対象公園: 全{len(targets)}箇所（木場・猿江・亀戸・有明・東綾瀬など）",
+                f"期間: {first.strftime('%m/%d')} 〜 {last.strftime('%m/%d')}",
+                "状況: 現在、条件に合致する空き枠はありません。\n",
+                "※正常に10分おきで監視を継続しています。",
+                "※新しい空き枠が出た瞬間に、即座に空き枠お知らせメールをお送りします。\n",
+                "━━━━━━━━━━━━━━━━━━━━",
+                "▼ スポレク（東京都立公園予約システム）：",
+                "https://kouen.sports.metro.tokyo.lg.jp/web/",
+                "━━━━━━━━━━━━━━━━━━━━"
+            ]
+            notify(subj, "\n".join(lines))
+            state["last_hourly_report"] = now_dt.isoformat()
+            save_state(state)
 
 
 if __name__ == "__main__":
