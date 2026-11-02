@@ -3,23 +3,55 @@
     {
       "sport": "1000_1030",
       "park": "1060",
-      "memo": "木場公園"
+      "memo": "木場公園",
+      "days": "all"
+    },
+    {
+      "sport": "1000_1030",
+      "park": "1000",
+      "memo": "日比谷公園",
+      "days": "weekday"
+    },
+    {
+      "sport": "1000_1030",
+      "park": "1010",
+      "memo": "芝公園",
+      "days": "weekday"
     },
     {
       "sport": "1000_1030",
       "park": "1040",
-      "memo": "猿江恩賜公園"
+      "memo": "猿江恩賜公園",
+      "days": "holiday"
     },
     {
       "sport": "1000_1030",
       "park": "1050",
-      "memo": "亀戸中央公園"
+      "memo": "亀戸中央公園",
+      "days": "holiday"
+    },
+    {
+      "sport": "1000_1030",
+      "park": "1160",
+      "memo": "大島小松川公園",
+      "days": "holiday"
+    },
+    {
+      "sport": "1000_1030",
+      "park": "1150",
+      "memo": "篠崎公園Ａ",
+      "days": "holiday"
     }
   ],
   "weekend_all": true,
   "weekday_start_from": 19,
   "holidays_as_weekend": true,
   "days_from": 6,
+  "short_notice": {
+    "enabled": true,
+    "from_days": 0,
+    "min_hours_before": 2
+  },
   "days_ahead": 60,
   "wait_seconds": 2,
   "auto_book": {
@@ -29,7 +61,7 @@
     "max_active": null,
     "one_per_day": false,
     "try_per_run": null,
-    "max_attempts_per_slot": 2,
+    "max_attempts_per_slot": 5,
     "players": 4
   },
   "release": {
@@ -47,5 +79,14 @@
     ],
     "start_delay_seconds": 1,
     "login_minutes_before": 5
+  },
+  "server": {
+    "interval_minutes": 5,
+    "night_hours": [],
+    "night_interval_minutes": 60,
+    "release_hold_hours": 3,
+    "release_hold_interval_seconds": 60,
+    "release_prepare_at": "23:45",
+    "release_hold_until": "02:00"
   }
 }

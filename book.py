@@ -26,7 +26,8 @@ ONLINE_PAY = ("オンライン", "クレジット", "事前決済", "カード")
 ONSITE_PAY = ("現地", "窓口", "当日", "後払", "施設で", "支払わない")
 
 
-BOOK_VERSION = "2026-10-23 v4（仮押さえの解除・選択失敗の理由）"
+BOOK_VERSION = "2026-11-02 v10（テスト予約つき）"
+LOGIN_WAIT_MS = 300000   # ログインの各段階で、画面が出るまで最大5分待つ
 print("book.py 版:", BOOK_VERSION)
 
 
@@ -68,19 +69,72 @@ class Booker:
     def text(self):
         return self.page.inner_text("body")
 
+    # スポレクの入口のサーバーが、奥のサーバーから返事をもらえなかったときの画面の文
+    SERVER_ERROR_WORDS = ("Proxy Error", "Bad Gateway", "Service Unavailable",
+                          "Gateway Timeout", "Internal Server Error")
+    # やり直すのは、スポレクのエラー画面が出たとき・5分待っても進まないときだけ（最大3回）
+    LOGIN_RETRY_WAITS = (30, 60, 120)
+
+    def _server_error(self, resp=None):
+        """スポレク側のエラー画面なら、その名前を返す（ふつうの画面なら空文字）"""
+        if resp is not None and resp.status >= 500:
+            return f"サーバー側のエラー {resp.status}"
+        try:
+            body = self.text()[:3000]
+        except Exception:
+            return ""
+        for w in self.SERVER_ERROR_WORDS:
+            if w in body:
+                return w
+        return ""
+
     def login(self):
+        """スポレクはログインで長く考えることがあるので、すぐにはあきらめない"""
+        waits = self.LOGIN_RETRY_WAITS
+        for i in range(len(waits) + 1):
+            try:
+                self._login_once()
+                return
+            except Stop:
+                raise          # ID・パスワードの間違い、画像認証などは、やり直しても同じ
+            except Exception as e:
+                if i == len(waits):
+                    raise Stop(f"スポレクがログインに応えないため、{len(waits)}回やり直しても"
+                               f"ログインできませんでした（{str(e)[:100]}）")
+                print(f"  ログインに失敗（{str(e)[:100]}）。{waits[i]}秒後にやり直します"
+                      f"（{i + 1}/{len(waits)}）", flush=True)
+                self.shot("login_retry")
+                time.sleep(waits[i])
+
+    def _login_once(self):
         pg = self.page
-        pg.goto(f"{BASE}/", wait_until="domcontentloaded", timeout=90000)
+        resp = pg.goto(f"{BASE}/", wait_until="domcontentloaded", timeout=LOGIN_WAIT_MS)
+        err = self._server_error(resp)
+        if err:
+            raise RuntimeError(f"ホーム画面がエラー: {err}")
         if pg.evaluate("typeof gRecaptchaActive !== 'undefined' && gRecaptchaActive === true"):
             raise Stop("ログイン画面で画像認証（reCAPTCHA）が有効になっています。自動ログインはしません")
-        pg.click("#btn-login")
-        pg.wait_for_selector("#userId", timeout=60000)
+        btn = pg.query_selector("#btn-login")
+        if not (btn and btn.is_visible()):
+            # 前回の送信が、遅れて実は通っていた場合など。もうログインしている
+            print("  ログイン済みでした")
+            self.shot("after_login")
+            return
+        pg.click("#btn-login", timeout=LOGIN_WAIT_MS)
+        pg.wait_for_selector("#userId", timeout=LOGIN_WAIT_MS)
         if pg.evaluate("typeof gRecaptchaActive !== 'undefined' && gRecaptchaActive === true"):
             raise Stop("ログイン画面で画像認証（reCAPTCHA）が有効になっています。自動ログインはしません")
         pg.fill("#userId", os.environ["SPOREC_USER_ID"])
         pg.fill("#password", os.environ["SPOREC_PASSWORD"])
-        with pg.expect_navigation(timeout=90000):
+        with pg.expect_navigation(timeout=LOGIN_WAIT_MS) as nav:   # ログインの送信は長く考えることがある
             pg.click("#btn-go")
+        try:
+            resp = nav.value
+        except Exception:
+            resp = None
+        err = self._server_error(resp)
+        if err:
+            raise RuntimeError(f"ログインの送信後にエラー: {err}")
         body = self.text()
         if pg.query_selector("#userId"):
             self.shot("login_failed")
@@ -202,7 +256,7 @@ class Booker:
         """空き状況画面上の1枠を予約する。成功で True、空いていなければ False、途中停止は Stop"""
         pg = self.page
         cid = f'{v["useDay"]}_{v["tzoneNo"]}'
-        if not self.wait_week(cid, 10) or not self.cell_available(cid):
+        if not self.wait_week(cid, 60) or not self.cell_available(cid):
             return False
         n_dlg = len(self.dialogs)
         pg.evaluate(f"""(() => {{
@@ -210,7 +264,7 @@ class Booker:
             (td.querySelector('[onclick*="setReserv"]') || td).click();
         }})()""")
         try:
-            pg.wait_for_function("document.form1.selectSize && document.form1.selectSize.value != '0'", timeout=30000)
+            pg.wait_for_function("document.form1.selectSize && document.form1.selectSize.value != '0'", timeout=90000)
         except PwTimeout:
             self.shot("select_failed")
             msg = self.dialogs[-1].replace("\n", " ") if len(self.dialogs) > n_dlg else "警告なし"
@@ -218,7 +272,7 @@ class Booker:
             return None   # 空いているのに選べなかった
         self.shot("selected")
         try:
-            with pg.expect_navigation(timeout=30000):
+            with pg.expect_navigation(timeout=90000):
                 pg.evaluate("checkSelect(document.form1, gRsvWOpeReservedApplyAction)")
         except PwTimeout:
             self.shot("apply_not_opened")
@@ -228,6 +282,7 @@ class Booker:
     def walk_apply(self, v):
         """申込画面から先を進める。画面の内容は文字で判断し、分からなければ止まる"""
         pg = self.page
+        recaptcha_clicked = False  # 1件の申込につきクリックは最大1回
         for step in range(8):
             pg.wait_for_load_state("domcontentloaded")
             self.shot(f"apply{step}")
@@ -238,6 +293,8 @@ class Booker:
                 raise RuntimeError("エラー画面になりました: " + re.sub(r"\s+", " ", body)[:200])
             self.choose_onsite_payment()
             self.fill_basics()
+            if not REHEARSAL:
+                recaptcha_clicked = self.check_reservation_recaptcha(recaptcha_clicked)
             btns = self.buttons()
             nxt = [b for b in btns if any(w in b[1] for w in NEXT_WORDS) and not any(w in b[1] for w in FINAL_WORDS)]
             fin = [b for b in btns if any(w in b[1] for w in FINAL_WORDS)
@@ -262,15 +319,105 @@ class Booker:
                 raise Stop("次に押すボタンが判断できない画面になったため止めました（見つかったボタン：" + names + "）")
             print(f"  「{target[1]}」を押します")
             before = pg.url + str(len(body))
+            n_dlg, n_fr = len(self.dialogs), len(pg.frames)
             target[0].click()
-            try:
-                pg.wait_for_load_state("domcontentloaded", timeout=90000)
-                pg.wait_for_timeout(1500)
-            except PwTimeout:
-                pass
+            self.wait_change(before, n_dlg, n_fr, 90)
             if pg.url + str(len(self.text())) == before and self.dialogs and "入力" in self.dialogs[-1]:
                 raise Stop("入力不足の警告が出ました: " + self.dialogs[-1])
         raise Stop("申込画面が想定より長く続いたため止めました")
+
+    def wait_change(self, before, n_dlg, n_fr, sec=90):
+        """ボタンを押したあと、画面が実際に変わるまで待つ（スポレクは反応が遅いことがある）。
+        変わったら True。sec 秒待っても変わらなければ False（そのまま次の判断へ進む）"""
+        pg = self.page
+        end = time.time() + sec
+        while time.time() < end:
+            try:
+                pg.wait_for_load_state("domcontentloaded", timeout=max(1000, int((end - time.time()) * 1000)))
+            except PwTimeout:
+                break
+            except Exception:
+                pass
+            try:
+                if (pg.url + str(len(self.text())) != before or len(self.dialogs) > n_dlg
+                        or len(pg.frames) != n_fr):
+                    pg.wait_for_timeout(1500)   # 変わった直後は表示が落ち着くまで少し待つ
+                    return True
+            except Exception:
+                pass   # 画面の切り替わり中は読めないことがある
+            pg.wait_for_timeout(1000)
+        print(f"  {sec}秒待っても画面が変わりませんでした。画面を確かめて続けます")
+        return False
+
+    def recaptcha_widgets(self):
+        """表示中の reCAPTCHA のチェック欄だけを取得する（非表示のバッジは除く）。"""
+        widgets = []
+        for frame in self.page.frames:
+            if "recaptcha" not in frame.url.lower():
+                continue
+            try:
+                if not frame.frame_element().is_visible():
+                    continue
+                anchor = frame.locator("#recaptcha-anchor")
+                if anchor.count() and anchor.first.is_visible():
+                    widgets.append(anchor.first)
+            except Exception:
+                # 表示中の認証フレームを読めなければ予約を進めない。
+                raise Stop("reCAPTCHAの状態を確認できないため止めました")
+        return widgets
+
+    def recaptcha_image_challenge(self):
+        """画像・音声などの追加認証が表示されたか。解答やトークン操作はしない。"""
+        for frame in self.page.frames:
+            if "recaptcha" not in frame.url.lower():
+                continue
+            try:
+                if not frame.frame_element().is_visible():
+                    continue
+                challenge = frame.locator("#rc-imageselect, #recaptcha-audio-button, #audio-source")
+                for i in range(challenge.count()):
+                    if challenge.nth(i).is_visible():
+                        return True
+            except Exception:
+                raise Stop("追加認証の状態を確認できないため止めました")
+        return False
+
+    def check_reservation_recaptcha(self, clicked):
+        """チェック欄を通常のクリックで1回押し、実際に認証済みになるまで待つ。"""
+        if self.recaptcha_image_challenge():
+            self.shot("recaptcha_manual_required")
+            raise Stop("画像・音声などの追加認証が出たため止めました。手動で予約してください")
+        widgets = self.recaptcha_widgets()
+        if not widgets:
+            return clicked
+        if len(widgets) != 1:
+            raise Stop("reCAPTCHAのチェック欄が複数あるため止めました")
+        anchor = widgets[0]
+        if anchor.get_attribute("aria-checked") == "true":
+            return clicked
+        if clicked:
+            self.shot("recaptcha_not_verified")
+            raise Stop("reCAPTCHAが再び未認証になったため止めました（繰り返しクリックはしません）")
+        print("  「私はロボットではありません」を1回クリックします")
+        try:
+            anchor.click(timeout=5000)
+        except Exception:
+            self.shot("recaptcha_click_failed")
+            raise Stop("reCAPTCHAのチェック欄をクリックできないため止めました")
+        # 認証結果だけを最大30秒待つ。画像の解答・トークン偽装・再クリックはしない。
+        until = time.monotonic() + 30
+        while time.monotonic() < until:
+            if self.recaptcha_image_challenge():
+                self.shot("recaptcha_manual_required")
+                raise Stop("画像・音声などの追加認証が出たため止めました。手動で予約してください")
+            widgets = self.recaptcha_widgets()
+            if len(widgets) == 1 and widgets[0].get_attribute("aria-checked") == "true":
+                self.shot("recaptcha_checked")
+                print("  reCAPTCHAにチェックが付きました。予約処理を続けます")
+                return True
+            self.page.wait_for_timeout(500)
+        self.shot("recaptcha_timeout")
+        raise Stop("reCAPTCHAの認証が30秒以内に完了しないため止めました（予約は続けません）")
 
     def buttons(self):
         """押せる部品（ボタン・リンク・onclick付き要素）を集める。画面上部のメニューは除く"""
@@ -372,6 +519,51 @@ class Booker:
             return [...new Set(out)];
         }""")
 
+LAST_STOP = None   # 直前の run が止まった理由（サーバーでの見張り用）
+
+
+class Session:
+    """ブラウザを開いたまま使い回す（サーバーで常駐するとき）。session を渡さなければ毎回開いて閉じる"""
+
+    def __init__(self):
+        self.p = self.browser = self.b = None
+        self.born = 0
+
+    def start(self):
+        if self.b is None:
+            self.p = sync_playwright().start()
+            self.browser = self.p.chromium.launch()
+            page = self.browser.new_page(locale="ja-JP", viewport={"width": 1280, "height": 1600})
+            page.set_default_timeout(120000)
+            self.b = Booker(page)
+            self.born = time.time()
+        return self.b
+
+    def logged_in(self):
+        """ホーム画面を開き、右上が「ログイン」ボタンなら未ログイン"""
+        try:
+            pg = self.start().page
+            pg.goto(f"{BASE}/", wait_until="domcontentloaded", timeout=120000)
+            el = pg.query_selector("#btn-login")
+            return not (el and el.is_visible())
+        except Exception:
+            return False
+
+    def ensure_login(self):
+        b = self.start()
+        if not self.logged_in():
+            _orig_login(b)
+        return b
+
+    def close(self):
+        for x in (self.browser, self.p):
+            try:
+                x.close() if x is self.browser else x.stop()
+            except Exception:
+                pass
+        self.p = self.browser = self.b = None
+
+
 def deadline(date_iso):
     d = dt.date.fromisoformat(date_iso)
     return (d - dt.timedelta(days=4)).isoformat()
@@ -401,27 +593,41 @@ def group_by_week(cands):
     return out
 
 
-def run(candidates, max_new, title):
+def run(candidates, max_new, title, session=None):
     """候補を優先順に予約する。結果を通知して state.json に記録する"""
     state = load_state()
     booked_days = {b["date"] for b in state["booked"]}
     booked_times = {(b["date"], b.get("start")) for b in state["booked"]}
     max_new = max_new if max_new else float("inf")   # None = 上限なし
     results, done, stop_reason = [], 0, None
-    if not candidates:
+    lazy = callable(candidates)   # 監視（watch）：ログインと同時に空きを調べ、終わってから候補を受け取る
+    get_candidates = candidates if lazy else None
+    if lazy:
+        candidates = []
+    if not lazy and not candidates:
         print("予約候補はありません")
         if title == "22日一斉予約":
             notify(f"【{title}】候補なし", "条件に合う翌月分の枠が見つかりませんでした（予約は行っていません）")
         return
     weeks, grid_ok, grid_ng, empty = 0, 0, 0, 0
     select_ng, reset_done = 0, False
-    with sync_playwright() as p:
-        browser = p.chromium.launch()
-        page = browser.new_page(locale="ja-JP", viewport={"width": 1280, "height": 1600})
-        page.set_default_timeout(60000)
-        b = Booker(page)
+    own = session is None
+    sess = session or Session()
+    if True:
+        b = sess.start()
         try:
-            b.login()
+            if own or not sess.logged_in():
+                b.login()          # 22日は、このあと0時まで待つ
+            elif _WAIT_UNTIL:
+                _wait_open(b)      # ログイン済みの画面のまま0時まで待つ
+            if lazy:
+                candidates = get_candidates()
+                get_candidates = None
+                state = load_state()   # 空き確認が state.json を更新しているので読み直す
+                booked_days = {x["date"] for x in state["booked"]}
+                booked_times = {(x["date"], x.get("start")) for x in state["booked"]}
+                if not candidates:
+                    print("予約する候補はありません（ログインしたまま終了）")
             for opener, group in group_by_week(candidates):
                 need_open = True
                 for v in group:
@@ -494,7 +700,26 @@ def run(candidates, max_new, title):
             stop_reason = f"想定外のエラー: {str(e)[:200]}"
             b.shot("error")
         finally:
-            browser.close()
+            if own or stop_reason:
+                sess.close()   # 止まったときは、次の回にブラウザを開き直してログインし直す
+    global LAST_STOP
+    LAST_STOP = stop_reason
+    if lazy and get_candidates:
+        # ログインで止まった場合も、空き確認（通知）は最後まで終わらせる
+        try:
+            candidates = get_candidates()
+        except Exception as e:
+            print(f"空き確認のエラー: {e}")
+            candidates = []
+        state = load_state()
+    if lazy and not candidates:
+        if not stop_reason:
+            import glob
+            for f in glob.glob(os.path.join(SHOTS, "*")):
+                os.remove(f)   # 空きがない回の画面は残さない
+        if stop_reason:
+            print(f"停止: {stop_reason}（予約する候補がないので通知はしません）")
+        return
     save_state(state)
     lines = [f"候補 {len(candidates)} 枠／画面を開いた週 {weeks}（表が出た {grid_ok}・出なかった {grid_ng}）／"
              f"空いていなかった枠 {empty}／空きなのに選べなかった枠 {select_ng}／予約 {done} 件", ""] + results
@@ -527,7 +752,7 @@ def release_candidates():
                     for c in r.get("timeResult", []):
                         d = dt.datetime.strptime(str(c["useDay"]), "%Y%m%d").date()
                         if first <= d <= last and d >= lo and c.get("alt") != "保守日" \
-                                and cc.wanted(d, c["startTime"], c["useDay"] in hol):
+                                and cc.wanted(d, c["startTime"], c["useDay"] in hol, tgt):
                             cands.append({"key": f'{tgt["sport"]}_{tgt["park"]}_{inst}_{c["useDay"]}_{c["startTime"]}',
                                           "sport": tgt["sport"], "bld": str(tgt["park"]), "inst": inst,
                                           "useDay": c["useDay"], "tzoneNo": r["tzoneNo"], "start": c["startTime"],
@@ -547,7 +772,7 @@ def release_candidates():
     return cands
 
 
-def release(now_flag):
+def release(now_flag, session=None):
     rel = CONFIG.get("release", {})
     if not rel.get("enabled", True):
         print("22日の一斉予約は無効です")
@@ -579,7 +804,7 @@ def release(now_flag):
         groups = group_by_week(cands)
         _PREOPEN = groups[0][0] if groups else None
     from check_courts import lim
-    run(cands, lim(rel.get("max_bookings")), "22日一斉予約")
+    run(cands, lim(rel.get("max_bookings")), "22日一斉予約", session=session)
     state = load_state()
     state["release_done"] = month
     save_state(state)
@@ -594,6 +819,10 @@ def _login_then_wait(self):
     """22日：0時の数分前にログインし、最初に見る週の空き状況画面を開いたまま0時を待つ。
     待っている間も2分おきに画面を開き直して、ログイン状態が切れないようにする"""
     _orig_login(self)
+    _wait_open(self)
+
+
+def _wait_open(self):
     if not _WAIT_UNTIL:
         return
     print(f"  受付開始 {_WAIT_UNTIL:%H:%M:%S} まで、空き状況画面を開いて待機します")
@@ -634,6 +863,43 @@ def hourly():
     run(queue, min(n) if n else None, "テニス自動予約")
 
 
+def watch(session=None):
+    """毎日の確認：ログイン（ブラウザ）と空き確認（ログイン不要の検索）を同時に始め、
+    条件に合う空きがあれば、ログイン済みの画面ですぐ予約する"""
+    import threading, check_courts as cc
+    if not AB.get("enabled"):
+        cc.main()
+        return
+    box = {}
+
+    def work():
+        try:
+            cc.main()
+        except Exception as e:
+            box["err"] = e
+
+    th = threading.Thread(target=work, daemon=True)
+    th.start()
+
+    def get():
+        th.join()
+        if "err" in box:
+            raise RuntimeError(f"空き状況の確認でエラー: {box['err']}")
+        queue = json.load(open(QUEUE_PATH, encoding="utf-8")) if os.path.exists(QUEUE_PATH) else []
+        state = load_state()
+        cap, per = cc.lim(AB.get("max_active")), cc.lim(AB.get("max_per_run"))
+        if cap is not None and len(state["booked"]) >= cap:
+            print("自動予約の上限に達しています")
+            return []
+        n = [x for x in ((None if cap is None else cap - len(state["booked"])), per) if x is not None]
+        return queue[:min(n)] if n else queue
+
+    if os.environ.get("TEST_BOOK"):
+        run(get, 1, "【テスト予約】テニス自動予約", session=session)   # 1件だけ
+        return
+    run(get, None, "テニス自動予約", session=session)
+
+
 if __name__ == "__main__":
     for k in ("SPOREC_USER_ID", "SPOREC_PASSWORD"):
         if not os.environ.get(k):
@@ -641,5 +907,7 @@ if __name__ == "__main__":
             sys.exit(1)
     if "--release" in sys.argv:
         release("--now" in sys.argv)
+    elif "--watch" in sys.argv:
+        watch()
     else:
         hourly()
