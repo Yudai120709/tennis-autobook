@@ -2,12 +2,15 @@ name: テニスコート空き監視・通知
 
 on:
   schedule:
-    # 【ふだん】毎日24時間ずっと5分おきに空き確認（完全ノンストップ）
-    - cron: "*/5 * * * *"
-    # 【22日一斉解放】絶対に出遅れないための多段先行起動
-    # 日本時間 21日 23:30 / 23:40 / 23:50（UTC 14:30 / 14:40 / 14:50）
+    # 【ふだん】3時間ごとに起動し、内部で3時間ノンストップ（5分おき巡回）を継続
+    # 0時、3時、6時、9時、12時、15時、18時、21時（UTC基準でも3時間間隔）
+    - cron: "55 */3 * * *"
+    # 【22日一斉解放】絶対に出遅れないための超早め・多段先行起動（21日23:00から1時間前スタンバイ）
+    # 日本時間 21日 23:00 / 23:15 / 23:30 / 23:45 / 23:50（UTC 14:00 / 14:15 / 14:30 / 14:45 / 14:50）
+    - cron: "0 14 21 * *"
+    - cron: "15 14 21 * *"
     - cron: "30 14 21 * *"
-    - cron: "40 14 21 * *"
+    - cron: "45 14 21 * *"
     - cron: "50 14 21 * *"
   workflow_dispatch:
     inputs:
@@ -20,6 +23,7 @@ on:
 permissions:
   contents: write
 
+# ジョブの重複を安全に制御（前の3時間ループが終わるまで待機して綺麗にバトンタッチ）
 concurrency:
   group: tennis
   cancel-in-progress: false
@@ -27,7 +31,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -37,29 +41,28 @@ jobs:
       - name: 必要なライブラリをインストール
         run: pip install requests
 
-      - name: 実行する処理を決める（21日夜の待機制御含む）
+      - name: 実行する処理を決める
         id: task
         run: |
-          # 日本時間（JST）の「日」と「時」を取得
           d=$(TZ=Asia/Tokyo date +%-d)
           h=$(TZ=Asia/Tokyo date +%-H)
           m=$(TZ=Asia/Tokyo date +%-M)
 
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "task=${{ inputs.task }}" >> "$GITHUB_OUTPUT"
-          elif [ "${{ github.event.schedule }}" = "30 14 21 * *" ] || [ "${{ github.event.schedule }}" = "40 14 21 * *" ] || [ "${{ github.event.schedule }}" = "50 14 21 * *" ]; then
+          elif [ "${{ github.event.schedule }}" = "0 14 21 * *" ] || [ "${{ github.event.schedule }}" = "15 14 21 * *" ] || [ "${{ github.event.schedule }}" = "30 14 21 * *" ] || [ "${{ github.event.schedule }}" = "45 14 21 * *" ] || [ "${{ github.event.schedule }}" = "50 14 21 * *" ]; then
             echo "task=release" >> "$GITHUB_OUTPUT"
           else
-            # 21日の日本時間 22:00〜23:59 は翌0時の解放準備のため通常巡回を休止
-            if [ "$d" -eq 21 ] && [ "$h" -ge 22 ]; then
-              echo "日本時間 21日 ${h}:${m} は22日一斉解放直前の待機時間のため、通常巡回をスキップします"
+            # 21日の日本時間 21:00〜23:59 は解放準備のため休止
+            if [ "$d" -eq 21 ] && [ "$h" -ge 21 ]; then
+              echo "日本時間 21日 ${h}:${m} は解放直前の待機時間のため休止します"
               echo "task=skip" >> "$GITHUB_OUTPUT"
             else
-              echo "task=check" >> "$GITHUB_OUTPUT"
+              echo "task=loop" >> "$GITHUB_OUTPUT"
             fi
           fi
 
-      - name: 空き確認を実行（通常）
+      - name: 空き確認を実行（手動単発実行）
         if: steps.task.outputs.task == 'check'
         env:
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
@@ -67,7 +70,15 @@ jobs:
           MAIL_TO: ${{ secrets.MAIL_TO }}
         run: python check_courts.py
 
-      - name: 22日一斉解放スキャン（00:00:01 ジャストに実行）
+      - name: 遅延ゼロ・5分おき連続巡回を実行（3時間内部ループ）
+        if: steps.task.outputs.task == 'loop'
+        env:
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+        run: python check_courts.py --loop 180
+
+      - name: 22日一斉解放スキャン（00:00:01 ジャストに4並列実行）
         if: steps.task.outputs.task == 'release' || steps.task.outputs.task == 'release_now'
         env:
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
@@ -85,7 +96,6 @@ jobs:
             echo "更新なし"
           else
             git commit -m "update state [skip ci]" || true
-            # 競合防止のため pull --rebase してから push（最大3回リトライ）
             for i in {1..3}; do
               git pull --rebase origin main || true
               if git push origin main; then
