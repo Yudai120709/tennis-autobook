@@ -14,11 +14,14 @@ on:
     - cron: "50 14 21 * *"
   workflow_dispatch:
     inputs:
-      task:
-        description: "実行する処理"
+      mode:
+        description: "動作モード（通常はこのまま変更不要です）"
         type: choice
-        options: [loop, check, release_now]
-        default: loop
+        options:
+          - "通常監視（3時間連続・5分おき巡回）"
+          - "単発確認（今すぐ1回だけ確認して終了）"
+          - "22日一斉解放テスト（4並列最速スキャン）"
+        default: "通常監視（3時間連続・5分おき巡回）"
 
 permissions:
   contents: write
@@ -49,7 +52,20 @@ jobs:
           m=$(TZ=Asia/Tokyo date +%-M)
 
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "task=${{ inputs.task }}" >> "$GITHUB_OUTPUT"
+            case "${{ inputs.mode }}" in
+              "単発確認（今すぐ1回だけ確認して終了）")
+                echo "手動単発確認モードで実行します"
+                echo "task=check" >> "$GITHUB_OUTPUT"
+                ;;
+              "22日一斉解放テスト（4並列最速スキャン）")
+                echo "22日一斉解放テストモードで実行します"
+                echo "task=release" >> "$GITHUB_OUTPUT"
+                ;;
+              *)
+                echo "通常監視モード（3時間連続・5分おき巡回）で実行します"
+                echo "task=loop" >> "$GITHUB_OUTPUT"
+                ;;
+            esac
           elif [ "${{ github.event.schedule }}" = "0 14 21 * *" ] || [ "${{ github.event.schedule }}" = "15 14 21 * *" ] || [ "${{ github.event.schedule }}" = "30 14 21 * *" ] || [ "${{ github.event.schedule }}" = "45 14 21 * *" ] || [ "${{ github.event.schedule }}" = "50 14 21 * *" ]; then
             echo "task=release" >> "$GITHUB_OUTPUT"
           else
@@ -79,7 +95,7 @@ jobs:
         run: python check_courts.py --loop 180
 
       - name: 22日一斉解放スキャン（00:00:01 ジャストに4並列実行）
-        if: steps.task.outputs.task == 'release' || steps.task.outputs.task == 'release_now'
+        if: steps.task.outputs.task == 'release'
         env:
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
