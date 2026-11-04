@@ -35,38 +35,53 @@ def fetch(s, method, url, **kw):
 CONFIG = load_config()
 
 
+def dec(r):
+    return r.content.decode("cp932", "replace")
+
+
+def post(s, path, data):
+    body = urllib.parse.urlencode(data, encoding="cp932")
+    r = fetch(s, "POST", f"{BASE}/{path}", data=body,
+              headers={**UA, "Content-Type": "application/x-www-form-urlencoded", "Referer": f"{BASE}/"})
+    return dec(r)
+
+
+def form_fields(page):
+    f = {}
+    for t in re.findall(r"<input[^>]*>", page):
+        n = re.search(r'name="([^"]*)"', t)
+        if not n or re.search(r'type="(checkbox|radio)"', t):
+            continue
+        v = re.search(r'value="([^"]*)"', t)
+        f[n.group(1)] = html.unescape(v.group(1)) if v else ""
+    return f
+
+
 def open_search(s, sport, bld, day):
-    """空き検索画面を開いて利用目的・公園を選び、施設一覧を得る"""
-    s.headers.update(UA)
-    r = fetch(s, "GET", f"{BASE}/rsvWOpeInstSrchVacantAction.do")
-    m = re.search(r'action="([^"]+)"', r.text)
-    action = urllib.parse.urljoin(f"{BASE}/", m.group(1)) if m else f"{BASE}/rsvWOpeInstSrchVacantAction.do"
-    fetch(s, "POST", action, data={
-        "displayNo": "prw001000", "srchMode": "1", "srchBldCode": bld, "bldSrchSelect": "1",
-        "dispBldSrchSelect": "1", "usePurposeCodeList": sport, "subUsePurposeCodeList": "",
-        "useDayFrom": day.strftime("%Y%m%d"), "useTimeFrom": "0000", "useTimeTo": "2400",
-        "transSearchFlg": "1", "btnSearch": "空き状況検索"
-    })
-    r2 = fetch(s, "GET", f"{BASE}/rsvWOpeInstSrchVacantAction.do")
-    park = (re.search(r'class="ui-output-bldName">([^<]+)<', r2.text) or [None, ""])[1].strip()
-    insts = re.findall(r'<span class="ui-inst-table-body-instName">([^<]+)</span>.*?instNo" value="(\d+)"',
-                       r2.text, re.DOTALL)
-    if not insts:
-        insts = re.findall(r'instNo" value="(\d+)".*?<span class="ui-inst-table-body-instName">([^<]+)</span>',
-                           r2.text, re.DOTALL)
-        insts = [(no, name.strip()) for no, name in insts]
-    else:
-        insts = [(no, name.strip()) for name, no in insts]
-    return park, insts
+    """空き状況画面を開く（セッション作成を兼ねる）。公園名と施設（コート種別）一覧を返す"""
+    f = form_fields(dec(fetch(s, "GET", f"{BASE}/", headers=UA)))
+    cls, pps = sport.split("_")
+    d = day.strftime("%Y-%m-%d")
+    f.update(daystarthome=d, daystart=d, selectPpsClPpscd=sport, selectPpsClsCd=cls, selectPpsCd=pps,
+             selectAreaBcd=bld, selectBldCd=bld, dayofweekClearFlg="1", timezoneClearFlg="1")
+    page = post(s, "rsvWOpeInstSrchVacantAction.do", f)
+    if "空き状況画面" not in page:
+        raise RuntimeError(f"空き状況画面を開けませんでした（公園コード {bld}）")
+    m = re.search(r'name="selectBldName" value="([^"]*)"', page)
+    park = html.unescape(m.group(1)) if m else bld
+    sel = re.search(r'<select id="facility-select".*?</select>', page, re.S)
+    insts = re.findall(r'<option data-bldcd="[^"]*" value="([\d_]+)"[^>]*>([^<]*)<', sel.group(0)) if sel else []
+    return park, [(i.split("_")[0], n.strip()) for i, n in insts]
 
 
 def week(s, bld, inst, day):
-    """特定施設・特定週の空き状況（JSON）を取得"""
-    r = fetch(s, "POST", f"{BASE}/rsvWTransInstSrchVacantWeekAjaxAction.do", data={
-        "displayNo": "prw001010", "transInstSrchVacantWeek": "1",
-        "bldCode": bld, "instNo": inst, "useDay": day.strftime("%Y%m%d")
-    })
-    return r.json()
+    txt = post(s, "rsvWOpeInstSrchVacantAjaxAction.do", {
+        "displayNo": "prwrc2000", "useDay": day.strftime("%Y%m%d"), "bldCd": bld,
+        "instCd": inst, "transVacantMode": "0", "clearFlag": "0"})
+    try:
+        return json.loads(txt)
+    except ValueError:
+        raise RuntimeError("空き状況を取得できませんでした（セッション切れか画面変更の可能性）")
 
 
 def wanted(d, start, is_hol, tgt):
@@ -100,7 +115,8 @@ def scan_target(prio, tgt, first, last, wait):
                 for r in j.get("result", []):
                     for t in r.get("timeResult", []):
                         d = dt.datetime.strptime(str(t["useDay"]), "%Y%m%d").date()
-                        if t.get("status") == 0 and t.get("alt") == "空き" and first <= d <= last                                 and wanted(d, t["startTime"], t["useDay"] in hol, tgt):
+                        if t.get("status") == 0 and t.get("alt") == "空き" and first <= d <= last \
+                                and wanted(d, t["startTime"], t["useDay"] in hol, tgt):
                             found.append({
                                 "key": f'{sport}_{bld}_{inst}_{t["useDay"]}_{t["startTime"]}',
                                 "sport": sport, "bld": bld, "inst": inst, "useDay": t["useDay"],
@@ -160,29 +176,14 @@ def send_notification(new_slots, tag="【空き発見】"):
     notify(subj, body)
 
 
-def main():
-    is_release = "--release" in sys.argv
-    if is_release:
-        wait_until_release()
-
-    state = load_state()
-    state.setdefault("notified", {})
-
-    t = today()
-    first = t + dt.timedelta(days=CONFIG.get("days_from", 0))
-    last = t + dt.timedelta(days=CONFIG.get("days_ahead", 60))
-    wait = CONFIG.get("wait_seconds", 2)
-    targets = CONFIG.get("targets", [])
-
-    print(f"空き状況を確認中: {first} 〜 {last}（対象公園数: {len(targets)}）", flush=True)
-
+def run_single_check(is_release, targets, first, last, wait, state):
     all_found = []
 
     if is_release:
         # 【22日一斉解放時】最優先の上位4公園を 4並列で最速同時スキャン！
         top_targets = targets[:4]
         rest_targets = targets[4:]
-        print(f"▶ 第1弾：最優先4公園を同時に並行確認します（最大4並列）...", flush=True)
+        print("▶ 第1弾：最優先4公園を同時に並行確認します（最大4並列）...", flush=True)
         top_names = [t.get("memo", t.get("park")) for t in top_targets]
         print(f"   対象: {', '.join(top_names)}", flush=True)
 
@@ -208,9 +209,9 @@ def main():
                 state["notified"][s["key"]] = s["date"]
             save_state(state)
 
-        # 続いて残りの公園を2並列で確認（サーバーに過大な負荷をかけないよう配慮）
+        # 続いて残りの公園を2並列で確認
         if rest_targets:
-            print(f"▶ 第2弾：続いて残りの公園を確認します...", flush=True)
+            print("▶ 第2弾：続いて残りの公園を確認します...", flush=True)
             with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
                 futures = [executor.submit(scan_target, prio + 4, tgt, first, last, 1.0)
                            for prio, tgt in enumerate(rest_targets)]
@@ -219,7 +220,7 @@ def main():
                     if res:
                         all_found.extend(res)
     else:
-        # ふだんの定期確認（10分おき）：1公園ずつ確実に確認
+        # ふだんの定期確認：1公園ずつ確実に確認
         for prio, tgt in enumerate(targets):
             try:
                 f = scan_target(prio, tgt, first, last, wait)
@@ -246,13 +247,11 @@ def main():
     if last_report_str:
         try:
             last_report_dt = dt.datetime.fromisoformat(last_report_str)
-            # 前回送信から50分以上経過していれば送信（10分おき実行で毎時1回送るため）
             if (now_dt - last_report_dt).total_seconds() >= 3000:
                 send_hourly = True
         except Exception:
             send_hourly = True
     else:
-        # 初回は送信
         send_hourly = True
 
     if new_slots:
@@ -268,12 +267,12 @@ def main():
             print("1時間に1回の定期報告メールを送信します。", flush=True)
             subj = "【定期報告】テニスコート監視中（現在空きなし）"
             lines = [
-                f"{subj}\n",
+                subj + "\n",
                 f"確認時刻: {now_dt.strftime('%Y/%m/%d %H:%M')}",
                 f"対象公園: 全{len(targets)}箇所（木場・猿江・亀戸・有明・東綾瀬など）",
                 f"期間: {first.strftime('%m/%d')} 〜 {last.strftime('%m/%d')}",
                 "状況: 現在、条件に合致する空き枠はありません。\n",
-                "※正常に10分おきで監視を継続しています。",
+                "※正常に5分おきで監視を継続しています。",
                 "※新しい空き枠が出た瞬間に、即座に空き枠お知らせメールをお送りします。\n",
                 "━━━━━━━━━━━━━━━━━━━━",
                 "▼ スポレク（東京都立公園予約システム）：",
@@ -283,6 +282,63 @@ def main():
             notify(subj, "\n".join(lines))
             state["last_hourly_report"] = now_dt.isoformat()
             save_state(state)
+
+
+def main():
+    is_release = "--release" in sys.argv
+    if is_release:
+        wait_until_release()
+
+    # --loop MINUTES が指定された場合は、指定分数に達するまで5分おきに高精度ループ待機
+    loop_minutes = 0
+    for i, arg in enumerate(sys.argv):
+        if arg == "--loop" and i + 1 < len(sys.argv):
+            try:
+                loop_minutes = int(sys.argv[i + 1])
+            except ValueError:
+                loop_minutes = 30
+
+    state = load_state()
+    state.setdefault("notified", {})
+
+    t = today()
+    first = t + dt.timedelta(days=CONFIG.get("days_from", 0))
+    last = t + dt.timedelta(days=CONFIG.get("days_ahead", 60))
+    wait = CONFIG.get("wait_seconds", 2)
+    targets = CONFIG.get("targets", [])
+
+    INTERVAL_SECONDS = 300  # きっちり5分（300秒）間隔
+    start_time = time.time()
+    cycle = 1
+
+    while True:
+        cycle_start = time.time()
+        now_str = dt.datetime.now(JST).strftime("%H:%M:%S")
+        print("\n========================================", flush=True)
+        print(f"【第 {cycle} 周目】空き確認を開始します（時刻: {now_str}）", flush=True)
+        print(f"対象期間: {first} 〜 {last}（対象公園数: {len(targets)}）", flush=True)
+        print("========================================", flush=True)
+
+        run_single_check(is_release, targets, first, last, wait, state)
+
+        # releaseモード、またはループ指定なし（手動単発実行）の場合は1回で終了
+        if is_release or loop_minutes <= 0:
+            break
+
+        elapsed = time.time() - cycle_start
+        total_elapsed = time.time() - start_time
+
+        # 次の周を回すと予定時間を超える場合は終了して次へバトンタッチ
+        if total_elapsed + INTERVAL_SECONDS > loop_minutes * 60:
+            print(f"\n予定の実行時間（{loop_minutes}分）が経過したため、今回のジョブを完了します。", flush=True)
+            break
+
+        sleep_sec = max(10, INTERVAL_SECONDS - elapsed)
+        next_time = (dt.datetime.now(JST) + dt.timedelta(seconds=sleep_sec)).strftime("%H:%M:%S")
+        print(f"\n第 {cycle} 周目 完了（所要時間: {int(elapsed)}秒）。", flush=True)
+        print(f"▶ 次の確認は きっちり5分後（{next_time}）に開始します。{int(sleep_sec)}秒間待機中...", flush=True)
+        time.sleep(sleep_sec)
+        cycle += 1
 
 
 if __name__ == "__main__":
