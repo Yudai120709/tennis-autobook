@@ -328,9 +328,14 @@ def main():
         elapsed = time.time() - cycle_start
         total_elapsed = time.time() - start_time
 
-        # 次の周を回すと予定時間を超える場合は終了して次へバトンタッチ
-        if total_elapsed + INTERVAL_SECONDS > loop_minutes * 60:
-            print(f"\n予定の実行時間（{loop_minutes}分）が経過したため、今回のジョブを完了します。", flush=True)
+        # 次の周を回すと予定時間を超えるか、正時の交代時刻に到達した場合は次便へバトンタッチ
+        now_dt = dt.datetime.now(JST)
+        is_handover_time = (total_elapsed >= 150 * 60) and (now_dt.hour % 3 == 0) and (0 <= now_dt.minute <= 8)
+        is_timeout = (total_elapsed + INTERVAL_SECONDS > loop_minutes * 60)
+
+        if is_handover_time or is_timeout:
+            reason = "正時の交代時刻に到達したため、待機中の次便へバトンタッチします" if is_handover_time else f"予定時間（{loop_minutes}分）が経過したため完了します"
+            print(f"\n【バトンタッチ完了】{reason}（稼働時間: {int(total_elapsed // 60)}分）。", flush=True)
             break
 
         sleep_sec = max(10, INTERVAL_SECONDS - elapsed)
