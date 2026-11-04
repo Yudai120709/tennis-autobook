@@ -17,8 +17,8 @@ on:
       task:
         description: "実行する処理"
         type: choice
-        options: [check, release_now]
-        default: check
+        options: [loop, check, release_now]
+        default: loop
 
 permissions:
   contents: write
