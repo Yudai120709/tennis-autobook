@@ -19,10 +19,10 @@ on:
         description: "動作モード（通常はこのまま変更不要です）"
         type: choice
         options:
-          - "通常監視（3時間連続・5分おき巡回）"
+          - "通常監視（3時間連続・1分おき巡回）"
           - "単発確認（今すぐ1回だけ確認して終了）"
           - "22日一斉解放テスト（4並列最速スキャン）"
-        default: "通常監視（3時間連続・5分おき巡回）"
+        default: "通常監視（3時間連続・1分おき巡回）"
 
 permissions:
   contents: write
@@ -63,7 +63,7 @@ jobs:
                 echo "task=release" >> "$GITHUB_OUTPUT"
                 ;;
               *)
-                echo "通常監視モード（3時間連続・5分おき巡回）で実行します"
+                echo "通常監視モード（3時間連続・1分おき巡回）で実行します"
                 echo "task=loop" >> "$GITHUB_OUTPUT"
                 ;;
             esac
@@ -76,7 +76,7 @@ jobs:
               echo "日本時間 21日 ${h}:${m} は解放直前の待機時間のため休止します"
               echo "task=skip" >> "$GITHUB_OUTPUT"
             else
-              echo "通常監視モード（3時間連続・5分おき巡回）で実行します"
+              echo "通常監視モード（3時間連続・1分おき巡回）で実行します"
               echo "task=loop" >> "$GITHUB_OUTPUT"
             fi
           fi
@@ -89,7 +89,7 @@ jobs:
           MAIL_TO: ${{ secrets.MAIL_TO }}
         run: python check_courts.py
 
-      - name: 遅延ゼロ・5分おき連続巡回を実行（3時間内部ループ）
+      - name: 遅延ゼロ・1分おき高速巡回を実行（3時間内部ループ）
         if: steps.task.outputs.task == 'loop'
         env:
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
