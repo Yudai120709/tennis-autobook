@@ -76,7 +76,7 @@
   "weekend_all": true,
   "weekday_start_from": 19,
   "holidays_as_weekend": true,
-  "days_from": 6,
+  "days_from": 0,
   "short_notice": {
     "enabled": true,
     "from_days": 0,

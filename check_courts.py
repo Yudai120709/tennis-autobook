@@ -97,6 +97,28 @@ def wanted(d, start, is_hol, tgt):
     return start // 100 >= CONFIG.get("weekday_start_from", 19)
 
 
+def calc_target_range(today_date: dt.date) -> tuple[dt.date, dt.date]:
+    """
+    案A（都立スポレクの受付可能期間に完全連動）:
+    - 1日〜21日: 今日+days_from 〜 当月末日まで（翌月分は全コマ受付期間外のため除外）
+    - 22日〜末日: 今日+days_from 〜 翌月末日まで（22日0時に翌月分が一斉解放されるため網羅）
+    """
+    import calendar
+    days_from = int(CONFIG.get("days_from", 6))
+    first = today_date + dt.timedelta(days=days_from)
+    if today_date.day < 22:
+        _, last_day = calendar.monthrange(today_date.year, today_date.month)
+        last = dt.date(today_date.year, today_date.month, last_day)
+    else:
+        year = today_date.year + (1 if today_date.month == 12 else 0)
+        month = 1 if today_date.month == 12 else today_date.month + 1
+        _, last_day = calendar.monthrange(year, month)
+        last = dt.date(year, month, last_day)
+    if first > last:
+        first = last
+    return first, last
+
+
 def scan_target(prio, tgt, first, last, wait):
     """1公園分を順番に確認する"""
     bld, sport = str(tgt["park"]), tgt["sport"]
@@ -108,7 +130,7 @@ def scan_target(prio, tgt, first, last, wait):
         for inst, iname in insts:
             day = first
             while day <= last:
-                time.sleep(wait)
+                time.sleep(0.3)
                 j = week(s, bld, inst, day)
                 hol = {w["useDay"] for w in j.get("weekDay", []) if w.get("holidayFlg") == 4}
                 cells = [t for r in j.get("result", []) for t in r.get("timeResult", [])]
@@ -159,20 +181,92 @@ def wait_until_release():
             break
 
 
+def get_tokyo_rain_pops():
+    """気象庁の公式予報API（東京 130000）から直近数日間の降水確率を取得する"""
+    url = "https://www.jma.go.jp/bosai/forecast/data/forecast/130000.json"
+    pops_by_date = {}
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        for item in data:
+            for s in item.get("timeSeries", []):
+                time_defines = s.get("timeDefines", [])
+                for a in s.get("areas", []):
+                    if a.get("area", {}).get("code") == "130010":  # 東京地方
+                        pops = a.get("pops", [])
+                        if pops:
+                            for td, pop in zip(time_defines, pops):
+                                d_str = td[:10]
+                                val = int(pop) if pop.isdigit() else 0
+                                if d_str not in pops_by_date or val > pops_by_date[d_str]:
+                                    pops_by_date[d_str] = val
+    except Exception as e:
+        print(f"[天気] 降水確率の取得をスキップ: {e}")
+    return pops_by_date
+
+
 def send_notification(new_slots, tag="【空き発見】"):
-    """見つかった空き枠をメール通知する"""
+    """見つかった空き枠を、直前/来週以降に分類し、雨予報と最速ログインURL付きで通知する"""
     if not new_slots:
         return
-    subj = f"{tag}テニスコート空き枠 {len(new_slots)}件"
-    lines = [f"{subj}\n"]
-    lines.append("以下の枠に空きが見つかりました：\n")
+
+    today_d = today()
+    pops = get_tokyo_rain_pops()
+
+    urgent_slots = []
+    normal_slots = []
     for s in new_slots:
-        lines.append(f"・{label(s)}")
-    lines.append("\n━━━━━━━━━━━━━━━━━━━━")
-    lines.append("▼ 今すぐスポレクを開いて予約：")
-    lines.append("https://kouen.sports.metro.tokyo.lg.jp/web/")
+        d = dt.date.fromisoformat(s["date"])
+        diff = (d - today_d).days
+        if diff <= 5:
+            urgent_slots.append(s)
+        else:
+            normal_slots.append(s)
+
+    if urgent_slots and not normal_slots:
+        subj = f"【直前空き！今週末など】テニスコート空き枠 {len(urgent_slots)}件"
+    elif urgent_slots and normal_slots:
+        subj = f"【直前＆来週以降】テニスコート空き枠 合計{len(new_slots)}件"
+    else:
+        subj = f"{tag}テニスコート空き枠 {len(normal_slots)}件"
+
+    lines = [subj, "", "以下の枠に空きが見つかりました：", ""]
+
+    if urgent_slots:
+        lines.append("━━━━━━━━━━━━━━━━━━━━")
+        lines.append("⚡【直前・今週末のキャンセル枠（お早めに！）】")
+        for s in urgent_slots:
+            pop_info = ""
+            if s["date"] in pops:
+                p_val = pops[s["date"]]
+                if p_val >= 40:
+                    pop_info = f" ☔雨注意(降水確率{p_val}%)"
+                else:
+                    pop_info = f" ☀降水確率{p_val}%"
+            lines.append(f"・{label(s)}{pop_info}")
+        lines.append("")
+
+    if normal_slots:
+        lines.append("━━━━━━━━━━━━━━━━━━━━")
+        lines.append("📅【来週以降の予約枠】")
+        for s in normal_slots:
+            pop_info = ""
+            if s["date"] in pops:
+                p_val = pops[s["date"]]
+                if p_val >= 40:
+                    pop_info = f" ☔降水確率{p_val}%"
+                else:
+                    pop_info = f" ☀降水確率{p_val}%"
+            lines.append(f"・{label(s)}{pop_info}")
+        lines.append("")
+
     lines.append("━━━━━━━━━━━━━━━━━━━━")
-    body = "\n".join(lines)
+    lines.append("▼ 【最速ログイン】スポレク画面へ直行：")
+    lines.append("https://kouen.sports.metro.tokyo.lg.jp/web/rsvWUserLoginGo.do")
+    lines.append("※Face ID（自動入力）ですぐログインして予約へ進めます")
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    body = chr(10).join(lines)
     notify(subj, body)
 
 
@@ -220,15 +314,18 @@ def run_single_check(is_release, targets, first, last, wait, state):
                     if res:
                         all_found.extend(res)
     else:
-        # ふだんの定期確認：1公園ずつ確実に確認
-        for prio, tgt in enumerate(targets):
-            try:
-                f = scan_target(prio, tgt, first, last, wait)
-                if f:
-                    all_found.extend(f)
-                time.sleep(wait)
-            except Exception as e:
-                print(f"  {tgt.get('memo', tgt.get('park'))} の確認でエラー: {e}", flush=True)
+        # ふだんの定期確認：全12公園を 4並列で高速スキャン（所要時間: 約30〜40秒）
+        print(f"▶ 全{len(targets)}公園を4並列で高速スキャンします...", flush=True)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+            futures = [executor.submit(scan_target, prio, tgt, first, last, 0.3)
+                       for prio, tgt in enumerate(targets)]
+            for f in concurrent.futures.as_completed(futures):
+                try:
+                    res = f.result()
+                    if res:
+                        all_found.extend(res)
+                except Exception as e:
+                    print(f"  スキャン中にエラー: {e}", flush=True)
 
     # 全体の新規枠を整理
     uniq = {}
@@ -243,23 +340,27 @@ def run_single_check(is_release, targets, first, last, wait, state):
     # 1時間に1回の定期生存報告（空きがなくても送る）
     now_dt = dt.datetime.now(JST)
     last_report_str = state.get("last_hourly_report")
+    last_reported_hour = state.get("last_reported_hour")
     send_hourly = False
-    if last_report_str:
-        try:
-            last_report_dt = dt.datetime.fromisoformat(last_report_str)
-            if (now_dt - last_report_dt).total_seconds() >= 3000:
-                send_hourly = True
-        except Exception:
+    if last_reported_hour != now_dt.hour:
+        if 0 <= now_dt.minute <= 5:
             send_hourly = True
-    else:
-        send_hourly = True
-
+        elif not last_report_str:
+            send_hourly = True
+        else:
+            try:
+                last_report_dt = dt.datetime.fromisoformat(last_report_str)
+                if (now_dt - last_report_dt).total_seconds() >= 3600:
+                    send_hourly = True
+            except Exception:
+                send_hourly = True
     if new_slots:
         tag = "【22日一斉解放】" if is_release else "【空き発見】"
         send_notification(new_slots, tag=tag)
         for s in new_slots:
             state["notified"][s["key"]] = s["date"]
         state["last_hourly_report"] = now_dt.isoformat()
+        state["last_reported_hour"] = now_dt.hour
         save_state(state)
     elif not is_release:
         print("新規の空き枠はありませんでした。")
@@ -272,15 +373,16 @@ def run_single_check(is_release, targets, first, last, wait, state):
                 f"対象公園: 全{len(targets)}箇所（木場・猿江・亀戸・有明・東綾瀬など）",
                 f"期間: {first.strftime('%m/%d')} 〜 {last.strftime('%m/%d')}",
                 "状況: 現在、条件に合致する空き枠はありません。\n",
-                "※正常に5分おきで監視を継続しています。",
+                "※正常に1分おき（全公園高速並列）で監視を継続しています。",
                 "※新しい空き枠が出た瞬間に、即座に空き枠お知らせメールをお送りします。\n",
                 "━━━━━━━━━━━━━━━━━━━━",
                 "▼ スポレク（東京都立公園予約システム）：",
                 "https://kouen.sports.metro.tokyo.lg.jp/web/",
                 "━━━━━━━━━━━━━━━━━━━━"
             ]
-            notify(subj, "\n".join(lines))
+            notify(subj, chr(10).join(lines))
             state["last_hourly_report"] = now_dt.isoformat()
+            state["last_reported_hour"] = now_dt.hour
             save_state(state)
 
 
@@ -302,12 +404,11 @@ def main():
     state.setdefault("notified", {})
 
     t = today()
-    first = t + dt.timedelta(days=CONFIG.get("days_from", 0))
-    last = t + dt.timedelta(days=CONFIG.get("days_ahead", 60))
+    first, last = calc_target_range(t)
     wait = CONFIG.get("wait_seconds", 2)
     targets = CONFIG.get("targets", [])
 
-    INTERVAL_SECONDS = 300  # きっちり5分（300秒）間隔
+    INTERVAL_SECONDS = 60  # きっちり1分（60秒）間隔（高速並列巡回）
     start_time = time.time()
     cycle = 1
 
