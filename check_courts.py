@@ -380,7 +380,13 @@ def run_single_check(is_release, targets, first, last, wait, state):
                 "https://kouen.sports.metro.tokyo.lg.jp/web/",
                 "━━━━━━━━━━━━━━━━━━━━"
             ]
-            notify(subj, chr(10).join(lines))
+            # 定期報告はメールのみ送信（Discordは空き枠発見時のみ鳴らす）
+            orig_hook = os.environ.pop("DISCORD_WEBHOOK_URL", None)
+            try:
+                notify(subj, chr(10).join(lines))
+            finally:
+                if orig_hook:
+                    os.environ["DISCORD_WEBHOOK_URL"] = orig_hook
             state["last_hourly_report"] = now_dt.isoformat()
             state["last_reported_hour"] = now_dt.hour
             save_state(state)
