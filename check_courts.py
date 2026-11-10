@@ -224,12 +224,33 @@ def send_notification(new_slots, tag="【空き発見】"):
         else:
             normal_slots.append(s)
 
-    if urgent_slots and not normal_slots:
-        subj = f"【直前空き！今週末など】テニスコート空き枠 {len(urgent_slots)}件"
-    elif urgent_slots and normal_slots:
-        subj = f"【直前＆来週以降】テニスコート空き枠 合計{len(new_slots)}件"
+    # 件名に公園名と日時を明記する（スマホの通知バナーで一目でわかるように）
+    first_slot = new_slots[0]
+    p_name = first_slot.get("park", "テニス")
+    d_raw = first_slot.get("date", "")
+    d_short = d_raw[5:].replace("-", "/") if len(d_raw) >= 10 and d_raw[4] == '-' else d_raw
+    wd_str = f"({first_slot.get('wd', '')})" if first_slot.get('wd') else ""
+    t_str = first_slot.get("time", "")
+    slot_summary = f"{p_name} {d_short}{wd_str} {t_str}".strip()
+
+    num_slots = len(new_slots)
+    if "22日" in tag:
+        if num_slots >= 2:
+            prefix = f"【優先・{num_slots}枠空き/22日解放】"
+        else:
+            prefix = "【22日解放】"
+    elif num_slots >= 2:
+        prefix = f"【優先・{num_slots}枠空き】"
+    elif urgent_slots and not normal_slots:
+        prefix = "【直前空き】"
     else:
-        subj = f"{tag}テニスコート空き枠 {len(normal_slots)}件"
+        prefix = "【空き発見】"
+
+    if num_slots == 1:
+        subj = f"{prefix} {slot_summary}"
+    else:
+        extra = num_slots - 1
+        subj = f"{prefix} {slot_summary} 他{extra}件"
 
     lines = [subj, "", "以下の枠に空きが見つかりました：", ""]
 
@@ -270,49 +291,57 @@ def send_notification(new_slots, tag="【空き発見】"):
     notify(subj, body)
 
 
-def run_single_check(is_release, targets, first, last, wait, state):
+def run_single_check(is_release, targets, first, last, wait, state, allow_hourly_report=True):
     all_found = []
 
     if is_release:
-        # 【22日一斉解放時】最優先の上位4公園を 4並列で最速同時スキャン！
-        top_targets = targets[:4]
-        rest_targets = targets[4:]
-        print("▶ 第1弾：最優先4公園を同時に並行確認します（最大4並列）...", flush=True)
-        top_names = [t.get("memo", t.get("park")) for t in top_targets]
-        print(f"   対象: {', '.join(top_names)}", flush=True)
+        if len(targets) == 1:
+            # 【12台並列マトリックス時】1台1公園を最速スキャン！
+            t = targets[0]
+            print(f"▶ 【22日00:00:01 一斉解放】{t.get('memo', t.get('park'))} を最速スキャンします！", flush=True)
+            res = scan_target(0, t, first, last, 0.2)
+            if res:
+                all_found.extend(res)
+        else:
+            # 【手動全公園実行時】最優先の上位4公園を 4並列で最速同時スキャン！
+            top_targets = targets[:4]
+            rest_targets = targets[4:]
+            print("▶ 第1弾：最優先4公園を同時に並行確認します（最大4並列）...", flush=True)
+            top_names = [t.get("memo", t.get("park")) for t in top_targets]
+            print(f"   対象: {', '.join(top_names)}", flush=True)
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-            futures = [executor.submit(scan_target, prio, tgt, first, last, 0.5)
-                       for prio, tgt in enumerate(top_targets)]
-            for f in concurrent.futures.as_completed(futures):
-                res = f.result()
-                if res:
-                    all_found.extend(res)
-
-        # 最優先4公園で見つかった枠を「即座に第1報としてメール送信」！
-        uniq_first = {}
-        for slot in all_found:
-            if slot["key"] not in uniq_first:
-                uniq_first[slot["key"]] = slot
-        first_new_slots = [s for s in uniq_first.values() if s["key"] not in state["notified"]]
-        if first_new_slots:
-            first_new_slots = sorted(first_new_slots, key=lambda s: (s["date"], s["start"], s["prio"]))
-            print(f"★最優先4公園で {len(first_new_slots)} 件の空き枠を検知！即座に速報メールを送信します！", flush=True)
-            send_notification(first_new_slots, tag="【22日速報・最優先4公園】")
-            for s in first_new_slots:
-                state["notified"][s["key"]] = s["date"]
-            save_state(state)
-
-        # 続いて残りの公園を2並列で確認
-        if rest_targets:
-            print("▶ 第2弾：続いて残りの公園を確認します...", flush=True)
-            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-                futures = [executor.submit(scan_target, prio + 4, tgt, first, last, 1.0)
-                           for prio, tgt in enumerate(rest_targets)]
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+                futures = [executor.submit(scan_target, prio, tgt, first, last, 0.5)
+                           for prio, tgt in enumerate(top_targets)]
                 for f in concurrent.futures.as_completed(futures):
                     res = f.result()
                     if res:
                         all_found.extend(res)
+
+            # 最優先4公園で見つかった枠を「即座に第1報としてメール送信」！
+            uniq_first = {}
+            for slot in all_found:
+                if slot["key"] not in uniq_first:
+                    uniq_first[slot["key"]] = slot
+            first_new_slots = [s for s in uniq_first.values() if s["key"] not in state["notified"]]
+            if first_new_slots:
+                first_new_slots = sorted(first_new_slots, key=lambda s: (s["date"], s["start"], s["prio"]))
+                print(f"★最優先4公園で {len(first_new_slots)} 件の空き枠を検知！即座に速報メールを送信します！", flush=True)
+                send_notification(first_new_slots, tag="【22日速報・最優先4公園】")
+                for s in first_new_slots:
+                    state["notified"][s["key"]] = s["date"]
+                save_state(state)
+
+            # 続いて残りの公園を2並列で確認
+            if rest_targets:
+                print("▶ 第2弾：続いて残りの公園を確認します...", flush=True)
+                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                    futures = [executor.submit(scan_target, prio + 4, tgt, first, last, 1.0)
+                               for prio, tgt in enumerate(rest_targets)]
+                    for f in concurrent.futures.as_completed(futures):
+                        res = f.result()
+                        if res:
+                            all_found.extend(res)
     else:
         # ふだんの定期確認：全12公園を 4並列で高速スキャン（所要時間: 約30〜40秒）
         print(f"▶ 全{len(targets)}公園を4並列で高速スキャンします...", flush=True)
@@ -342,7 +371,7 @@ def run_single_check(is_release, targets, first, last, wait, state):
     last_report_str = state.get("last_hourly_report")
     last_reported_hour = state.get("last_reported_hour")
     send_hourly = False
-    if last_reported_hour != now_dt.hour:
+    if allow_hourly_report and (last_reported_hour != now_dt.hour):
         if 0 <= now_dt.minute <= 5:
             send_hourly = True
         elif not last_report_str:
@@ -354,6 +383,8 @@ def run_single_check(is_release, targets, first, last, wait, state):
                     send_hourly = True
             except Exception:
                 send_hourly = True
+    else:
+        send_hourly = False
     if new_slots:
         tag = "【22日一斉解放】" if is_release else "【空き発見】"
         send_notification(new_slots, tag=tag)
@@ -373,8 +404,8 @@ def run_single_check(is_release, targets, first, last, wait, state):
                 f"対象公園: 全{len(targets)}箇所（木場・猿江・亀戸・有明・東綾瀬など）",
                 f"期間: {first.strftime('%m/%d')} 〜 {last.strftime('%m/%d')}",
                 "状況: 現在、条件に合致する空き枠はありません。\n",
-                "※正常に1分おき（全公園高速並列）で監視を継続しています。",
-                "※新しい空き枠が出た瞬間に、即座に空き枠お知らせメールをお送りします。\n",
+                "※全12公園を12台のサーバーが超高速（確認後2秒待機・マンマーク並列）で常時監視しています。",
+                "※新しい空き枠が出た瞬間に、即座にDiscordおよびメールでお知らせします。\n",
                 "━━━━━━━━━━━━━━━━━━━━",
                 "▼ スポレク（東京都立公園予約システム）：",
                 "https://kouen.sports.metro.tokyo.lg.jp/web/",
@@ -397,14 +428,27 @@ def main():
     if is_release:
         wait_until_release()
 
-    # --loop MINUTES が指定された場合は、指定分数に達するまで5分おきに高精度ループ待機
+    # 引数パース: --loop, --target-index, --interval
     loop_minutes = 0
+    target_index = None
+    interval_seconds = 2  # 既定: 2秒待機スキャン
+
     for i, arg in enumerate(sys.argv):
         if arg == "--loop" and i + 1 < len(sys.argv):
             try:
                 loop_minutes = int(sys.argv[i + 1])
             except ValueError:
                 loop_minutes = 30
+        elif arg == "--target-index" and i + 1 < len(sys.argv):
+            try:
+                target_index = int(sys.argv[i + 1])
+            except ValueError:
+                target_index = None
+        elif arg == "--interval" and i + 1 < len(sys.argv):
+            try:
+                interval_seconds = int(sys.argv[i + 1])
+            except ValueError:
+                interval_seconds = 10
 
     state = load_state()
     state.setdefault("notified", {})
@@ -412,9 +456,20 @@ def main():
     t = today()
     first, last = calc_target_range(t)
     wait = CONFIG.get("wait_seconds", 2)
-    targets = CONFIG.get("targets", [])
+    all_targets = CONFIG.get("targets", [])
 
-    INTERVAL_SECONDS = 60  # きっちり1分（60秒）間隔（高速並列巡回）
+    if target_index is not None and 0 <= target_index < len(all_targets):
+        targets = [all_targets[target_index]]
+        assigned_name = targets[0].get("memo", f"Target-{target_index}")
+        print(f"【担当公園マンマーク】No.{target_index}: {assigned_name} を超高速（確認後{interval_seconds}秒待機）で監視します", flush=True)
+        # 代表（target 0）だけ定期報告メールを送信。それ以外は空き枠発見時のみ送信
+        allow_hourly = (target_index == 0)
+    else:
+        targets = all_targets
+        assigned_name = f"全{len(targets)}公園"
+        allow_hourly = True
+
+    INTERVAL_SECONDS = interval_seconds
     start_time = time.time()
     cycle = 1
 
@@ -426,10 +481,10 @@ def main():
         print(f"対象期間: {first} 〜 {last}（対象公園数: {len(targets)}）", flush=True)
         print("========================================", flush=True)
 
-        run_single_check(is_release, targets, first, last, wait, state)
+        run_single_check(is_release, targets, first, last, wait, state, allow_hourly_report=allow_hourly)
 
         # releaseモード、またはループ指定なし（手動単発実行）の場合は1回で終了
-        if is_release or loop_minutes <= 0:
+        if loop_minutes <= 0:
             break
 
         elapsed = time.time() - cycle_start
@@ -445,10 +500,10 @@ def main():
             print(f"\n【バトンタッチ完了】{reason}（稼働時間: {int(total_elapsed // 60)}分）。", flush=True)
             break
 
-        sleep_sec = max(10, INTERVAL_SECONDS - elapsed)
+        sleep_sec = max(1, interval_seconds)
         next_time = (dt.datetime.now(JST) + dt.timedelta(seconds=sleep_sec)).strftime("%H:%M:%S")
         print(f"\n第 {cycle} 周目 完了（所要時間: {int(elapsed)}秒）。", flush=True)
-        print(f"▶ 次の確認は きっちり5分後（{next_time}）に開始します。{int(sleep_sec)}秒間待機中...", flush=True)
+        print(f"▶ 次の確認は {int(sleep_sec)}秒後（{next_time}）に開始します。待機中...", flush=True)
         time.sleep(sleep_sec)
         cycle += 1
 
