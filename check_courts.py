@@ -10,7 +10,7 @@ import requests
 from common import BASE, WEEK, load_config, load_state, save_state, today, notify, label
 
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (personal tennis-court watcher)"}
-RETRY_WAITS = (5, 15, 30)   # スポレクが遅い・つながらないときの再試行待機秒数
+RETRY_WAITS = (1, 1, 2, 2, 2, 2, 2, 2, 2, 2)   # スポレク激重時対策：1〜2秒間隔で最大10回しつこく食らいつく
 JST = dt.timezone(dt.timedelta(hours=9))
 
 
@@ -207,7 +207,7 @@ def get_tokyo_rain_pops():
 
 
 def send_notification(new_slots, tag="【空き発見】"):
-    """見つかった空き枠を、直前/来週以降に分類し、雨予報と最速ログインURL付きで通知する"""
+    """見つかった空き枠を、直前/来週以降に分類し、雨予報と最速iPhone直行URL付きで通知する"""
     if not new_slots:
         return
 
@@ -224,7 +224,6 @@ def send_notification(new_slots, tag="【空き発見】"):
         else:
             normal_slots.append(s)
 
-    # 件名に公園名と日時を明記する（スマホの通知バナーで一目でわかるように）
     first_slot = new_slots[0]
     p_name = first_slot.get("park", "テニス")
     d_raw = first_slot.get("date", "")
@@ -266,6 +265,8 @@ def send_notification(new_slots, tag="【空き発見】"):
                 else:
                     pop_info = f" ☀降水確率{p_val}%"
             lines.append(f"・{label(s)}{pop_info}")
+            direct_url = f"https://kouen.sports.metro.tokyo.lg.jp/web/index.jsp#target={s.get('bld')}&date={s.get('date')}&sport={s.get('sport')}"
+            lines.append(f"  👉【直行ワープ】: {direct_url}")
         lines.append("")
 
     if normal_slots:
@@ -280,16 +281,21 @@ def send_notification(new_slots, tag="【空き発見】"):
                 else:
                     pop_info = f" ☀降水確率{p_val}%"
             lines.append(f"・{label(s)}{pop_info}")
+            direct_url = f"https://kouen.sports.metro.tokyo.lg.jp/web/index.jsp#target={s.get('bld')}&date={s.get('date')}&sport={s.get('sport')}"
+            lines.append(f"  👉【直行ワープ】: {direct_url}")
         lines.append("")
 
     lines.append("━━━━━━━━━━━━━━━━━━━━")
-    lines.append("▼ 【最速ログイン】スポレク画面へ直行：")
-    lines.append("https://kouen.sports.metro.tokyo.lg.jp/web/rsvWUserLoginGo.do")
-    lines.append("※Face ID（自動入力）ですぐログインして予約へ進めます")
+    lines.append("▼ 【iPhone最速直行】")
+    first_bld = first_slot.get('bld')
+    first_date = first_slot.get('date')
+    first_sport = first_slot.get('sport')
+    first_url = f"https://kouen.sports.metro.tokyo.lg.jp/web/index.jsp#target={first_bld}&date={first_date}&sport={first_sport}"
+    lines.append(f"👉 1件目へ直行: {first_url}")
+    lines.append("※タップするとSafariが開き、自動ログイン＆該当日付へ一発ワープします")
     lines.append("━━━━━━━━━━━━━━━━━━━━")
     body = chr(10).join(lines)
     notify(subj, body)
-
 
 def run_single_check(is_release, targets, first, last, wait, state, allow_hourly_report=True):
     all_found = []
@@ -401,7 +407,7 @@ def run_single_check(is_release, targets, first, last, wait, state, allow_hourly
             lines = [
                 subj + "\n",
                 f"確認時刻: {now_dt.strftime('%Y/%m/%d %H:%M')}",
-                f"対象公園: 全{len(targets)}箇所（木場・猿江・亀戸・有明・東綾瀬など）",
+                f"対象公園: 全{len(all_targets)}箇所（木場・日比谷・芝・猿江・亀戸・大島・篠崎・有明・東綾瀬・東白鬚・汐入）",
                 f"期間: {first.strftime('%m/%d')} 〜 {last.strftime('%m/%d')}",
                 "状況: 現在、条件に合致する空き枠はありません。\n",
                 "※全12公園を12台のサーバーが超高速（確認後2秒待機・マンマーク並列）で常時監視しています。",
@@ -411,13 +417,8 @@ def run_single_check(is_release, targets, first, last, wait, state, allow_hourly
                 "https://kouen.sports.metro.tokyo.lg.jp/web/",
                 "━━━━━━━━━━━━━━━━━━━━"
             ]
-            # 定期報告はメールのみ送信（Discordは空き枠発見時のみ鳴らす）
-            orig_hook = os.environ.pop("DISCORD_WEBHOOK_URL", None)
-            try:
-                notify(subj, chr(10).join(lines))
-            finally:
-                if orig_hook:
-                    os.environ["DISCORD_WEBHOOK_URL"] = orig_hook
+            # 定期報告メールを送信
+            notify(subj, chr(10).join(lines))
             state["last_hourly_report"] = now_dt.isoformat()
             state["last_reported_hour"] = now_dt.hour
             save_state(state)
